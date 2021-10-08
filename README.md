@@ -1,3 +1,3 @@
 # VTAMIQ
 
-[October 4, 2021] Code to be released soon.
+[October 8, 2021] Readme and examples to be released soon.
