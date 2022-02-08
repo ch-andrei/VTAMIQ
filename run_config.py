@@ -145,7 +145,7 @@ vtamiq_config = OrderedDict(
 vtamiq_runtime_config = OrderedDict(
     # there are two stages to pretraining VTAMIQ:
     # i) pretrain only ViT on ImageNet,
-    # ii) pretrain the complete QBERT on KADIS-700k
+    # ii) pretrain the complete KADIS-700k
 
     # toggle whether using pretrained ViT (Imagenet) is allowed
     allow_pretrained_vit=True,
@@ -195,15 +195,9 @@ dataset_config_base = OrderedDict(
     normalize_imagenet=True,
 
     patch_sampler_config=OrderedDict(
-        # centerbias_weight=0,
         centerbias_weight=2,
-
-        # diffbased_weight=0,
-        diffbased_weight=5,
-        # uniform_weight=1,
-        uniform_weight=0.25,
-
-        cache_use=False,
+        diffbased_weight=2,
+        uniform_weight=0.5,
     ),
 )
 

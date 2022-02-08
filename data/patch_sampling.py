@@ -1,20 +1,18 @@
 import numpy as np
 from scipy.ndimage import zoom
 from scipy.special import logsumexp
-# from scipy.signal import convolve2d
-from scipy.ndimage import gaussian_filter
-import hashlib
-import math
+from skimage.util.shape import view_as_windows
 
 
 class PatchSampler(object):
+    __centerbias_image_path__ = "./modules/Attention/deepgaze2/centerbias.npy"
+
     def __init__(self,
                  centerbias_weight=0.,
                  diffbased_weight=0.,
                  uniform_weight=1.,
                  diffbased_pow=2,
-                 cache_use=False,
-                 cache_size=1024,  # TODO: implement this
+                 prenormalize=True
                  ):
         """
         class to generate i,j coordinates for sampling patches from a 2D image
@@ -27,139 +25,76 @@ class PatchSampler(object):
         self.centerbias_weight = max(0., centerbias_weight)
         self.diffbased_weight = max(0., diffbased_weight)
         self.diffbased_pow = diffbased_pow
+        self.prenormalize = prenormalize
 
         total_weight = self.uniform_weight + self.diffbased_weight + self.centerbias_weight
         assert total_weight != 0, "Must specify non-zero weights."
 
-        self.cache_use = cache_use
-        self.cache_size = cache_size
-        self.prob_cache = {}  # will store precomputed probability maps for speedup
-
         if self.centerbias_weight > 0:
-            centerbias_image_path = "modules/Attention/deepgaze2/centerbias.npy"
-            self.centerbias_template = np.load(centerbias_image_path)
+            self.centerbias_template = np.load(self.__centerbias_image_path__)
 
     def __call__(self, h, w, ho, wo, imgs=None, num_samples=1):
+        # return self.get_sample_params(h, w, ho, wo, imgs, num_samples)
         return self.get_sample_params(h, w, ho, wo, imgs, num_samples)
 
     def get_sample_params(self, h, w, ho, wo, imgs=None, num_samples=1):
         if self.diffbased_weight == 0 and self.centerbias_weight == 0:
-            return [get_random_crop_params(h, w, ho, wo) for _ in range(num_samples)]
+            # stratified grid with equal probability for each cell
+            return stratified_grid_sampling(h, w, ho, wo, sample_prob=np.ones((h, w)), num_samples=num_samples)
         else:
-            # # remove out of bounds area
-            hi = h - ho
-            wi = w - wo
+            # compute centerbiased component
+            centerbias = 0
+            if self.centerbias_weight > 0:
+                centerbias = centerbias_prob(self.centerbias_template, h, w)
+                centerbias = centerbias / np.max(centerbias)
 
+            diffbased = 0
+            # compute diffbased component
             if self.diffbased_weight > 0:
-                assert imgs is not None, "PatchSampler: 'imgs' input must be specified for difference-based sampling."
-                ref_img = np.array(imgs[0])
+                assert imgs is not None, "PatchSampler: 'imgs' input must be specified for difference based sampling."
+
+                def pil2np(img):
+                    im = np.array(img).astype(float)
+                    if self.prenormalize:
+                        im -= im.min()
+                        im /= im.max()
+                    return im
+
+                ref_img = pil2np(imgs[0])
                 diff = np.zeros_like(ref_img)
                 for dist_img in imgs[1:]:
-                    diff += np.abs(ref_img - np.array(dist_img))
+                    dist_img = pil2np(dist_img)
+                    diff += np.abs(ref_img - dist_img)
                 diff = diff / (len(imgs) - 1)  # average the difference
-                cached_name = compute_hashname(diff, hi, wi)
-            else:
-                cached_name = (hi, wi)
 
-            # check cached probability maps
-            if self.cache_use and cached_name in self.prob_cache:
-                sample_prob = self.prob_cache[cached_name]
-            else:
-                # if not in cache, recompute
-                # print('computing for', cached_name)
+                diffbased = np.abs(diff)
 
-                centerbias = 0
-                # compute centerbiased component
-                if self.centerbias_weight > 0:
-                    centerbias = centerbias_prob(self.centerbias_template, h, w)
-                    centerbias = centerbias / np.max(centerbias)
-                    centerbias = centerbias[ho//2: hi+ho//2, wo//2: wi+wo//2]
+                pow = self.diffbased_pow
+                if len(diffbased.shape) > 2:
+                    diffbased = np.sum(diffbased * diffbased, axis=2)  # L2 distance over color channels
+                    pow = pow / 2
 
-                diffbased = 0
-                # compute diffbased component
-                if self.diffbased_weight > 0:
-                    diffbased = np.abs(diff)
+                diffbased = np.power(diffbased, pow)
 
-                    pow = self.diffbased_pow
-                    if len(diffbased.shape) > 2:
-                        diffbased = np.sum(diffbased * diffbased, axis=2)  # L2 distance over color channels
-                        pow = pow / 2
+                if np.sum(diffbased) > 1e-6:  # avoid failure case when there is little (no) difference
+                    diffbased = diffbased / np.max(diffbased)  # normalize to [0-1]
+                else:
+                    diffbased = 0
 
-                    diffbased = np.power(diffbased, pow)
+            # add uniform weight
+            sample_prob = self.centerbias_weight * centerbias + \
+                          self.diffbased_weight * diffbased + \
+                          self.uniform_weight
 
-                    if np.sum(diffbased) < 1e-6:  # failure case when there is no difference
-                        diffbased += 1  # handles zero error cases by adding uniform error
+            # normalize probability; ensure that the total sum is equal 1
+            sample_prob = sample_prob / np.sum(sample_prob)
 
-                    dmax = np.max(diffbased)
-                    diffbased = diffbased / (1. if dmax == 0 else dmax)  # normalize to [0-1]
-
-                    # apply gaussian kernel to smoothen the difference map
-                    # image resolution influences its apparent blurriness when using same sigma for all resolutions;
-                    # want to approximately blur all resolutions similarly -> select sigma based on resolution
-                    gaussian_sigma = np.power(ho*ho+wo*wo, 1/4)  # empirically, decent heuristic for size vs blurriness
-                    diffbased = gaussian_filter(diffbased, sigma=gaussian_sigma, mode="constant", cval=0)
-
-                    # crop to probability space
-                    diffbased = diffbased[ho//2: hi+ho//2, wo//2: wi+wo//2]
-                    dmax = np.max(diffbased)
-                    diffbased = diffbased / (1. if dmax == 0 else dmax)
-
-                # add uniform weight
-                sample_prob = self.centerbias_weight * centerbias + \
-                              self.diffbased_weight * diffbased + \
-                              self.uniform_weight
-
-                # normalize probability; ensure that the total sum is equal 1
-                sample_prob = sample_prob / np.sum(sample_prob)
-
-                # # debug plotting
-                # plt_show("sample_prob", sample_prob)
-
-                # compute cumulative sum over all probs
-                # note: the last value in this list equals ~1.0 -> sample_prob[-1] = ~1.0
-                sample_prob = np.cumsum(sample_prob.flatten())
-
-                if self.cache_use:
-                    self.prob_cache[cached_name] = sample_prob
-
-            return get_n_random_crop_params_bias(hi, wi, ho, wo, sample_prob, num_samples)
-
-
-def compute_hashname(img, a, b):
-    """
-    encodes the image using its str representation (similar to chechsum).
-    Considers a small part of the array, its numpy ToString() representation and its average value.
-    The above should be unique enough to represent most plausible images without cache repetition.
-    :param img:
-    :return:
-    """
-    to_str = lambda v: str(abs(v))[:6]
-    as_str = "{}-{}-{}-{}-{}".format(a, b, str(img), to_str(img.min()), to_str(img.mean()), to_str(img.max()))
-    return str(hashlib.sha256(as_str.encode()).hexdigest())
-
-
-def get_random_crop_params(h, w, ho, wo):
-    """Get parameters for ``crop`` for a random crop.
-    Args:
-        :param w: input width
-        :param h: input height
-        :param wo: output width
-        :param ho: output height
-
-    Returns:
-        tuple: params (i, j, h, w) to be passed to ``crop`` for random crop.
-    """
-    if w <= wo and h <= ho:
-        return 0, 0, h, w
-
-    i = np.random.randint(0, h - ho)
-    j = np.random.randint(0, w - wo)
-    return i, j, ho, wo
+            return stratified_grid_sampling(h, w, ho, wo, sample_prob=sample_prob, num_samples=num_samples)
 
 
 def centerbias_prob(bias, h, w):
     # rescale to match image size
-    centerbias = zoom(bias, (h / 1024, w / 1024), order=0, mode='nearest')
+    centerbias = zoom(bias, (h / 1024, w / 1024), order=0, mode='nearest')  # original centerbias is 1024x1024
     # renormalize log density after performing zoom
     centerbias -= logsumexp(centerbias)
     # softmax for probabilities
@@ -167,108 +102,101 @@ def centerbias_prob(bias, h, w):
     return centerbias_p
 
 
-def binary_search(arr, x, low, high):
-    if low < high:
-        mid = (high + low) // 2
-        if x < arr[mid]:
-            return binary_search(arr, x, low, mid - 1)
+def perturbed_grid(h, w, perturb_amount=.75):
+    rsamples = perturb_amount * np.random.rand(2, h, w)
+    gh, gw = np.meshgrid(np.arange(0., w, 1.), np.arange(0., h, 1.))
+    gh += rsamples[0]
+    gw += rsamples[1]
+    return np.concatenate([np.atleast_3d(gh), np.atleast_3d(gw)], axis=2)
+
+
+def halton_sequence(n, b):
+    m, d = 0, 1
+    samples = np.zeros(n)
+    for i in range(n):
+        x = d - m
+        if x == 1:
+            m = 1
+            d *= b
         else:
-            return binary_search(arr, x, mid + 1, high)
-    else:
-        return low - 1
-
-
-def get_n_random_crop_params_bias(h, w, ho, wo, sample_prob, num_samples=1):
-    rsamples = np.random.rand(num_samples).astype(np.float32)
-    sample_prob = sample_prob.reshape(-1, 1).astype(np.float32)
-
-    samples = []
-
-    for i in range(num_samples):
-        sample = rsamples[i]
-
-        ind = binary_search(sample_prob, sample, 0, len(sample_prob))
-
-        # convert to i, j indices
-        pos_i = int(ind / w)
-        pos_j = int(ind % w)
-
-        samples.append((pos_i, pos_j, ho, wo))
-
+            y = d // b
+            while x <= y:
+                y //= b
+            m = (b + 1) * y - x
+        samples[i] = m / d
     return samples
 
-def get_random_crop_params_bias(h, w, ho, wo, sample_prob):
-    """Get parameters for ``crop`` for a random crop given a probability bias.
-    Args:
-        :param w: input width
-        :param h: input height
-        :param wo: output width
-        :param ho: output height
-        :param sample_prob: bias map for sampling input image. Used as a probability map for sampling.
 
-    Returns:
-        tuple: params (i, j, h, w) to be passed to ``crop`` for random crop.
-    """
-    # get random sample over [0, 1], and find its location in probability list
-    sample = np.random.rand(1)
-    sample_index = binary_search(sample_prob, sample, 0, len(sample_prob) - 1)
-
-    # convert to i, j indices
-    i = int(sample_index / w)
-    j = sample_index % w
-
-    return i, j, ho, wo
+def halton_sequence_2d(n):
+    haltonx = halton_sequence(n, 2)
+    haltony = halton_sequence(n, 3)
+    return np.concatenate([haltonx, haltony], axis=0).reshape(2, -1)
 
 
-def plt_show(title, img):
-    plt.title(title)
-    plt.imshow(img)
-    plt.colorbar()
-    plt.show()
+def stratified_grid_sampling(h, w, ho, wo, sample_prob=None, num_samples=1, num_samples_cell=4):
+    __cells_r_min = 4  # minimum number of cells across max(h,w)
+    __cellsize_ratio_min = 0.025  # minimum cell size: max(h,w) / ratio (in pixels); note: scales with image size
 
+    aspect_ratio = max(h, w) / min(h, w)
+    num_cells_r = max(__cells_r_min, num_samples / num_samples_cell / num_samples_cell / aspect_ratio)
 
-if __name__=='__main__':
-    from matplotlib import pyplot as plt
-    from PIL import Image
+    cell_size = int(max(max(h, w) * __cellsize_ratio_min, max(h, w) // num_cells_r))
 
-    def imread(path):
-        im = Image.open(path).convert("RGB")
-        return np.array(im, np.float) / 255
+    # step size in the original array
+    sh = int(np.ceil((h - ho) / cell_size))
+    sw = int(np.ceil((w - wo) / cell_size))
 
-    path = "I:/Datasets/tid2013"
-    im1 = imread(path + "/reference_images/I01.BMP")
-    # im2 = imread(path + "/distorted_images/i01_01_4.BMP")  # random noise
-    # im2 = imread(path + "/distorted_images/i01_18_5.BMP")  # color diff
-    im2 = imread(path + "/distorted_images/i01_15_5.BMP")
-    # im2 = imread(path + "/distorted_images/i01_07_5.BMP")
-    # im2 = imread(path + "/distorted_images/i01_08_5.BMP")
-    diff = im2 - im1
-    ps = PatchSampler(
-        centerbias_weight=2,
-        diffbased_weight=10,
-        uniform_weight=0.5,
-    )
-    h, w = im1.shape[0], im1.shape[1]
-    out_dim = (16, 16)
-    hits = np.zeros((h, w))
-    num_samples = 15000
-    samples = ps.get_sample_params(h, w, out_dim[0], out_dim[1], imgs=(im1, im2), num_samples=num_samples)
-    for sample in samples:
-        x, y = sample[:2]
-        hits[x: x+out_dim[0], y: y+out_dim[1]] += 1
-        hit = hits[x: x+out_dim[0], y: y+out_dim[1]]
-        shape = hit.shape
-        if shape[0] < out_dim[0] or shape[1] < out_dim[1]:
-            print("NOT A GOOD SQUARE {}".format(shape))
+    # zero padded original probability array
+    probs = np.zeros((cell_size * sh + ho, cell_size * sw + wo))
+    probs[:h, :w] = sample_prob.reshape(h, w)
 
-    # plt_show("im", im1)
-    plt_show("MSE", np.sqrt(np.sum(diff * diff, axis=2)))
-    plt_show("Patches", hits)
-    plt_show("Image 1", im1)
-    plt_show("Image 2", im2)
+    probs = view_as_windows(probs, (cell_size + ho - 1, cell_size + wo - 1), (cell_size, cell_size))
+    probs = np.sum(probs, axis=(2, 3))
+    probs /= np.sum(probs)
+    num_patches = np.ceil((probs * num_samples)).astype(int)
 
-    centerbias_image_path = "modules/Attention/deepgaze2/centerbias.npy"
-    centerbias_template = np.load(centerbias_image_path)
-    centerbias = centerbias_prob(centerbias_template, h, w)
-    centerbias = centerbias / np.max(centerbias)
-    plt_show("Centerbias", centerbias)
+    # make sure total num patches doesnt exceed the queried number
+    num_patches_shape = num_patches.shape
+    num_patches = num_patches.flatten()
+    while num_samples < num_patches.sum():
+        ind_decr = (np.random.rand(num_patches.sum() - num_samples) * num_patches.shape[0]).astype(int)
+        num_patches[ind_decr] = np.maximum(num_patches[ind_decr] - 1, 0)
+    num_patches = num_patches.reshape(*num_patches_shape)
+
+    halton_seq = halton_sequence_2d(num_samples)
+
+    jmax = num_patches_shape[0] * cell_size + ho
+    imax = num_patches_shape[1] * cell_size + wo
+
+    jmax = num_patches_shape[0] - (jmax - h) / cell_size
+    imax = num_patches_shape[1] - (imax - w) / cell_size
+
+    num_cells = num_patches_shape[0] * num_patches_shape[1]
+    cells_order = np.random.permutation(num_cells)
+
+    patches_tot = 0
+    samples = []
+    for index in range(num_cells):
+        index = cells_order[index]
+
+        j = index // num_patches_shape[1]
+        i = index % num_patches_shape[1]
+
+        num_patches_c = num_patches[j, i]
+
+        if num_patches_c < 1:
+            continue
+
+        halton_seq_h = halton_seq[0, patches_tot: patches_tot + num_patches_c]
+        halton_seq_w = halton_seq[1, patches_tot: patches_tot + num_patches_c]
+
+        patches = np.zeros((2, num_patches_c), np.int)
+        patches[0] = np.minimum(j + halton_seq_h, jmax) * cell_size
+        patches[1] = np.minimum(i + halton_seq_w, imax) * cell_size
+
+        for k in range(num_patches_c):
+            samples.append((patches[0, k], patches[1, k], ho, wo))
+
+        patches_tot += num_patches_c
+
+    return samples

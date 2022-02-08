@@ -4,7 +4,7 @@ import run_main
 
 def train_custom_vtamiq():
     # load a KADIS pretrained model, better than nothing
-    global_config["load_checkpoint_file"] = "./output/1613318904-KADIS700k-p16-QBERT-B16-6L-4R-20e-9b-500p/best.pth"
+    global_config["load_checkpoint_file"] = "./output/1613318904-KADIS700k-p16-B16-6L-4R-20e-9b-500p/best.pth"
     vtamiq_runtime_config["allow_pretrained_vit"] = True  # load default pre-trained ViT transformer
     vtamiq_runtime_config["allow_load_model_vit"] = False  # prevent loading ViT from load_checkpoint_file
     vtamiq_runtime_config["allow_load_model_diffnet"] = True  # allow loading Diffnet from load_checkpoint_file
