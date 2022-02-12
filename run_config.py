@@ -114,7 +114,7 @@ global_config = OrderedDict(
 
     tensorlog_every_n_steps=10,  # for tensorboard writer
 
-    train_save_latest=True,  # always checkpoint regardless of accuracy
+    train_save_latest=False,  # always checkpoint regardless of accuracy
 
     output_dir="./output",
     output_txt="output.txt",
