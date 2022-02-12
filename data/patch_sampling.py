@@ -146,12 +146,23 @@ def stratified_grid_sampling(h, w, ho, wo, sample_prob=None, num_samples=1, num_
     sh = int(np.ceil((h - ho) / cell_size))
     sw = int(np.ceil((w - wo) / cell_size))
 
-    # zero padded original probability array
+    # maximum cell indices
+    jcell_dec = ((h - ho) / cell_size) % 1.
+    icell_dec = ((w - wo) / cell_size) % 1.
+
+    # zero padded original probability array to match full cell size and count
     probs = np.zeros((cell_size * sh + ho, cell_size * sw + wo))
     probs[:h, :w] = sample_prob.reshape(h, w)
 
     probs = view_as_windows(probs, (cell_size + ho - 1, cell_size + wo - 1), (cell_size, cell_size))
     probs = np.sum(probs, axis=(2, 3))
+
+    # rescale edge cell probabilities to compensate for partial cells
+    if 1e-3 < jcell_dec:
+        probs[  -1] *= jcell_dec
+    if 1e-3 < icell_dec:
+        probs[:,-1] *= icell_dec
+
     probs /= np.sum(probs)
     num_patches = np.ceil((probs * num_samples)).astype(int)
 
@@ -165,34 +176,33 @@ def stratified_grid_sampling(h, w, ho, wo, sample_prob=None, num_samples=1, num_
 
     halton_seq = halton_sequence_2d(num_samples)
 
-    jmax = num_patches_shape[0] * cell_size + ho
-    imax = num_patches_shape[1] * cell_size + wo
-
-    jmax = num_patches_shape[0] - (jmax - h) / cell_size
-    imax = num_patches_shape[1] - (imax - w) / cell_size
-
     num_cells = num_patches_shape[0] * num_patches_shape[1]
     cells_order = np.random.permutation(num_cells)
 
     patches_tot = 0
     samples = []
     for index in range(num_cells):
+        # current cell index
         index = cells_order[index]
-
         j = index // num_patches_shape[1]
         i = index % num_patches_shape[1]
 
-        num_patches_c = num_patches[j, i]
-
+        num_patches_c = num_patches[j, i]  # current cell num patches
         if num_patches_c < 1:
-            continue
+            continue  # zero patch case
 
         halton_seq_h = halton_seq[0, patches_tot: patches_tot + num_patches_c]
         halton_seq_w = halton_seq[1, patches_tot: patches_tot + num_patches_c]
 
+        # rescale edge cell indices to compensate for partial cells
+        if j == num_patches_shape[0] - 1 and 1e-3 < jcell_dec:
+            halton_seq_h *= jcell_dec
+        if i == num_patches_shape[1] - 1 and 1e-3 < icell_dec:
+            halton_seq_w *= icell_dec
+
         patches = np.zeros((2, num_patches_c), np.int)
-        patches[0] = np.minimum(j + halton_seq_h, jmax) * cell_size
-        patches[1] = np.minimum(i + halton_seq_w, imax) * cell_size
+        patches[0] = (j + halton_seq_h) * cell_size
+        patches[1] = (i + halton_seq_w) * cell_size
 
         for k in range(num_patches_c):
             samples.append((patches[0, k], patches[1, k], ho, wo))
