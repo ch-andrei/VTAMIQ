@@ -27,6 +27,7 @@ def get_b16_config():
         attention_dropout_rate=0.0,
         dropout_rate=0.1,
         batch_norm=True,
+        num_scales=5,
     )
     return vit_b16_config
 
@@ -42,6 +43,7 @@ def get_l16_config():
         attention_dropout_rate=0.0,
         dropout_rate=0.1,
         batch_norm=True,
+        num_scales=5,
     )
     return vit_l16_config
 
@@ -267,6 +269,28 @@ class Encoder(nn.Module):
         return encoded, attn_weights
 
 
+class ScaleEmbedding(nn.Module):
+    def __init__(self, config):
+        super(ScaleEmbedding, self).__init__()
+
+        hidden_size = config["hidden_size"]
+        num_scales = config["num_scales"]
+
+        self.num_scales = num_scales  # 1 for cls token
+        self.scale_embeddings = nn.Parameter(torch.zeros(1, self.num_scales + 1, hidden_size))
+
+    def forward(self, scale):
+        # scale = torch.floor(scale * self.num_scales) + 1  # offset for cls token
+        # print('scale', float(scale.min()), float(scale.max()))
+        scale = torch.clamp(scale, 0, self.num_scales) + 1  # offset for cls token
+        scale = scale.to(dtype=torch.long)
+        scale = self.scale_embeddings[:, scale[:, 0]]
+        return scale
+
+    def forward_cls_token(self):
+        return self.scale_embeddings[:, 0]
+
+
 class UvPosEmbedding(nn.Module):
     def __init__(self, config, img_dim=384):  # 384
         super(UvPosEmbedding, self).__init__()
@@ -275,16 +299,18 @@ class UvPosEmbedding(nn.Module):
         patch_size = config["patch_size"]
 
         self.width_pos_embeddings = img_dim // patch_size
-        self.num_pos_embeddings = self.width_pos_embeddings ** 2 + 1
-        self.positional_embeddings = nn.Parameter(torch.zeros(1, self.num_pos_embeddings, hidden_size))
+        num_pos_embeddings = self.width_pos_embeddings ** 2 + 1  # 1 for cls token embedding
+        self.positional_embeddings = nn.Parameter(torch.zeros(1, num_pos_embeddings, hidden_size))
 
     def forward(self, pos):
-        pos = (pos + 1.) / (2. + 1e-6)  # rescale to [0-1[, 1 exclusive
         pos = torch.floor(pos * self.width_pos_embeddings)
-        pos = (pos[:, 0] * self.width_pos_embeddings + pos[:, 1])
+        pos = (pos[:, 0] * self.width_pos_embeddings + pos[:, 1]) + 1  # +1 offset to step over cls token embedding
         pos = pos.to(dtype=torch.long)
         pos = self.positional_embeddings[:, pos]
         return pos
+
+    def forward_cls_token(self):
+        return self.positional_embeddings[:, 0]
 
     def load_from(self, weights):
         with torch.no_grad():
@@ -298,9 +324,9 @@ class UvPosEmbedding(nn.Module):
                 # apply rescaling
 
                 ntok_new = posemb_base.size(1)
+                ntok_new -= 1
 
                 posemb_tok, posemb_grid = posemb[:, :1], posemb[0, 1:]
-                ntok_new -= 1
 
                 gs_old = int(np.sqrt(len(posemb_grid)))
                 gs_new = int(np.sqrt(ntok_new))
@@ -316,40 +342,12 @@ class UvPosEmbedding(nn.Module):
             self.positional_embeddings.copy_(posemb)
 
 
-class GaussianFourierEmbedding(nn.Module):
-    def __init__(self,
-                 channels_in,
-                 channels_out,
-                 gaussian_scale=0.25,
-                 ):
-        super(GaussianFourierEmbedding, self).__init__()
-
-        assert channels_out % 2 == 0, \
-            "GaussianFourierEmbedding channels_out must be divisible by 2."
-
-        B_gauss = gaussian_scale * torch.randn(channels_out // 2, channels_in)
-        B_gauss -= B_gauss / 2  # move to [-amp, amp] range
-        pi = torch.tensor(np.pi)
-
-        self.register_buffer("B_gauss", B_gauss)
-        self.register_buffer("pi", pi)
-
-    # Fourier feature mapping
-    def forward(self, x):
-        x = (2.0 * self.pi * x) @ self.B_gauss.T
-        x = torch.cat([torch.sin(x), torch.cos(x)], dim=-1)
-        return x
-
-    def load_from(self, weights):
-        print("WARNING: GaussianFourierEmbedding.load_from() was called.")
-
-
 class Embeddings(nn.Module):
     def __init__(self,
                  config,
                  dropout=0.2,
                  img_dim=384,
-                 use_fourier_embeddings=False,
+                 use_scale_embedding=False,
                  ):
         super(Embeddings, self).__init__()
 
@@ -362,45 +360,62 @@ class Embeddings(nn.Module):
                                           kernel_size=patch_size,
                                           stride=patch_size)
 
-        if use_fourier_embeddings:
-            self.positional_embeddings = GaussianFourierEmbedding(channels_in=2, channels_out=hidden_size)
-        else:
-            self.positional_embeddings = UvPosEmbedding(config, img_dim)
-
         self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size), requires_grad=True)
+
+        self.positional_embeddings = UvPosEmbedding(config, img_dim)
+
+        self.use_scale_embedding = use_scale_embedding
+        if use_scale_embedding:
+            print("VTAMIQ: using ScaleEmbedding.")
+            self.scale_embeddings = ScaleEmbedding(config)
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x, pos):
+    def forward(self, x, pos, scales=None):
         B, N, C, P, P = x.shape
-        cls_token = self.cls_token.expand(B, -1, -1)
+
+        # compute patch embeddings
+        cls_tokens = self.cls_token.expand(B, -1, -1)
 
         x = x.view(B * N, C, P, P)
         x = self.patch_embeddings(x)
         x = x.view(B, N, -1)  # BxNxH
 
+        # add positional embeddings
         pos = pos.view(B * N, 2)
         pos = self.positional_embeddings(pos)
         pos = pos.view(B, N, -1)
         x = x + pos  # BxNxH
+        cls_tokens = cls_tokens + self.positional_embeddings.forward_cls_token()
 
-        x = torch.cat((cls_token, x), dim=1)
+        # add scale embeddings
+        if self.use_scale_embedding and scales is not None:
+            scales = scales.view(B * N, 2)
+            scales = self.scale_embeddings(scales)
+            scales = scales.view(B, N, -1)
+
+            x = x + scales
+            cls_tokens = cls_tokens + self.scale_embeddings.forward_cls_token()
+
+        x = torch.cat((cls_tokens, x), dim=1)
+
         x = self.dropout(x)
 
         return x
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, num_keep_layers=1, use_fourier_embeddings=False, vis=False):
+    def __init__(self, config, num_keep_layers=1, use_scale_embedding=False, vis=False, token=True):
         super(VisionTransformer, self).__init__()
-        self.use_fourier_embeddings = use_fourier_embeddings
-        self.embeddings = Embeddings(config, use_fourier_embeddings=use_fourier_embeddings)
+        self.embeddings = Embeddings(config, use_scale_embedding=use_scale_embedding)
         self.encoder = Encoder(config, num_keep_layers, vis)
+        self.token = token
 
-    def forward(self, x, pos):
-        x = self.embeddings(x, pos)  # this will reshape BxNxCxPxP into B x N+1 x H
+    def forward(self, x, pos, scales):
+        x = self.embeddings(x, pos, scales)  # this will reshape BxNxCxPxP into B x N+1 x H
         x, attn_weights = self.encoder(x)
-        x = x[:, 0]
+        if self.token:
+            x = x[:, 0]  # cls_token only
         return x
 
     def load_from(self, weights):
@@ -411,8 +426,7 @@ class VisionTransformer(nn.Module):
             self.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
             self.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
 
-            if not self.use_fourier_embeddings:
-                self.embeddings.positional_embeddings.load_from(weights)
+            self.embeddings.positional_embeddings.load_from(weights)
 
             for bname, block in self.encoder.named_children():
                 for uname, unit in block.named_children():

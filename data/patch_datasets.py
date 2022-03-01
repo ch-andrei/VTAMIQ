@@ -29,6 +29,7 @@ class PatchDataset(Dataset):
                  path,
                  patch_dim=16,
                  patch_count=256,
+                 patch_num_scales=1,
                  patch_sampler_config=None,
                  normalize=True,  # allow normalization
                  normalize_imagenet=True,  # force normalization with Imagenet mean and std dev
@@ -55,6 +56,7 @@ class PatchDataset(Dataset):
             raise ValueError("PatchDataset: unsupported patch_dim [{}]".format(patch_dim))
 
         self.patch_count = patch_count
+        self.patch_num_scales = max(1, patch_num_scales)
 
         if patch_sampler_config is None:
             patch_sampler_config = {}

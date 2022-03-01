@@ -12,11 +12,11 @@ class VTAMIQ(nn.Module):
                  vit_variant="B16",
                  vit_load_pretrained=True,
                  vit_num_keep_layers=-1,
+                 vit_use_scale_embedding=False,
                  num_residual_groups=4,
                  num_rcabs_per_group=4,
                  dropout=0.25,
                  is_full_reference=False,
-                 use_fourier_embeddings=False,
                  use_diff_embedding=True,
                  ):
         super(VTAMIQ, self).__init__()
@@ -25,7 +25,9 @@ class VTAMIQ(nn.Module):
 
         self.use_diff_embedding = use_diff_embedding
         self.is_full_reference = is_full_reference
-        self.transformer = VisionTransformer(vit_config, vit_num_keep_layers, use_fourier_embeddings)
+        self.transformer = VisionTransformer(vit_config,
+                                             num_keep_layers=vit_num_keep_layers,
+                                             use_scale_embedding=vit_use_scale_embedding)
 
         # transformer parameters
         hidden_size = vit_config["hidden_size"]
@@ -55,29 +57,39 @@ class VTAMIQ(nn.Module):
             nn.Linear(hidden_size // 4, 1),
         )
 
-    def set_freeze_state(self, freeze_state, allow_freeze_pos_embed):
+    def set_freeze_state(self, freeze_state,
+                         diffnet=True, encoder=True, embed_patch=True, embed_pos=True, embed_scale=True):
         print("VTAMIQ: Setting freeze state to", freeze_state)
 
         requires_grad = not freeze_state
 
-        # freeze diffnet
-        for param in self.diff_net.parameters():
-            param.requires_grad = requires_grad
-
-        # freeze transformer
-        for param in self.transformer.encoder.parameters():
-            param.requires_grad = requires_grad
-        if allow_freeze_pos_embed:
-            for param in self.transformer.embeddings.parameters():
+        def set_grad(layer, requires_grad):
+            for param in layer.parameters():
                 param.requires_grad = requires_grad
 
-    def forward_fr(self, patches, patches_pos):
+        if diffnet:
+            set_grad(self.diff_net, requires_grad)
+
+        if encoder:
+            set_grad(self.transformer.encoder, requires_grad)
+
+        if embed_patch:
+            self.transformer.embeddings.cls_token.requires_grad = requires_grad
+            set_grad(self.transformer.embeddings.patch_embeddings, requires_grad)
+
+        if embed_pos:
+            set_grad(self.transformer.embeddings.positional_embeddings, requires_grad)
+
+        if embed_scale and self.transformer.embeddings.use_scale_embedding:
+            set_grad(self.transformer.embeddings.scale_embeddings, requires_grad)
+
+    def forward_fr(self, patches, patches_pos, patches_scales):
         patches_ref, patches_dist = patches
 
         B, N, C, P, P = patches_ref.shape
 
-        feats_ref = self.transformer(patches_ref, patches_pos)
-        feats_dist = self.transformer(patches_dist, patches_pos)
+        feats_ref = self.transformer(patches_ref, patches_pos, patches_scales)
+        feats_dist = self.transformer(patches_dist, patches_pos, patches_scales)
         feats = feats_ref - feats_dist
 
         feats = feats.view(B, -1, 1, 1)  # B x H x 1 x 1
@@ -93,12 +105,12 @@ class VTAMIQ(nn.Module):
 
         return q
 
-    def forward_nr(self, patches, patches_pos):
+    def forward_nr(self, patches, patches_pos, patches_scales):
         patches_ref = patches[0]
 
         B, N, C, P, P = patches_ref.shape
 
-        feats = self.transformer(patches_ref, patches_pos)
+        feats = self.transformer(patches_ref, patches_pos, patches_scales)
 
         feats = feats.view(B, -1, 1, 1)  # B x H x 1 x 1
         feats = self.diff_net(feats)
@@ -109,8 +121,8 @@ class VTAMIQ(nn.Module):
 
         return q
 
-    def forward(self, patches, patches_pos):
+    def forward(self, patches, patches_pos, patches_scales):
         if self.is_full_reference:
-            return self.forward_fr(patches, patches_pos)
+            return self.forward_fr(patches, patches_pos, patches_scales)
         else:
-            return self.forward_nr(patches, patches_pos)
+            return self.forward_nr(patches, patches_pos, patches_scales)

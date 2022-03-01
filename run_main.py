@@ -129,11 +129,11 @@ def get_model(device, is_full_reference, checkpoint_file=None):
     model = global_config["model"]
     model_state_dict = get_model_state_dict(checkpoint_file, device) if pretrained_model else None
 
-    if model == MODEL_VTAMIQ:
-        print("Using Model: VTAMIQ.")
+    if model == MODEL_VTAMIQ or model == MODEL_VTAMIQp2b:
+        print("Using Model: {}.".format(model))
 
         # no need to load pretrained ViT transformer if already loading a pretrained VTAMIQ
-        vit_load_pretrained = vtamiq_runtime_config["allow_pretrained_vit"]
+        vit_load_pretrained = vtamiq_runtime_config["allow_pretrained_weights"]
 
         model = VTAMIQ(
             get_vit_config(vtamiq_config["vit_variant"]),
@@ -243,8 +243,8 @@ def store_model_params(model, output_dir):
 
 def get_data_tuple(batch, device):
     convert = lambda x: x.to(device, dtype=torch.float32)
-    out_data = (convert(batch[0]), )  # q values
-    for data in batch[1]:  # patches
+    out_data = tuple()  # q values
+    for data in batch:  # patches
         out_data += (convert(data), )
     return out_data
 
@@ -253,11 +253,11 @@ def model_predict(model, data, device, is_full_reference_iqa, is_pairwise, need_
     data = get_data_tuple(data, device)
 
     if is_pairwise:
-        q, patches_ref, patches_dist1, patches_dist2, patches_pos = data[:5]
+        q, patches_ref, patches_dist1, patches_dist2, patches_pos, patches_scales = data[:6]
 
         if need_pos_input:
-            q1 = model((patches_ref, patches_dist1), patches_pos)
-            q2 = model((patches_ref, patches_dist2), patches_pos)
+            q1 = model((patches_ref, patches_dist1), patches_pos, patches_scales)
+            q2 = model((patches_ref, patches_dist2), patches_pos, patches_scales)
         else:
             q1 = model((patches_ref, patches_dist1))
             q2 = model((patches_ref, patches_dist2))
@@ -266,14 +266,14 @@ def model_predict(model, data, device, is_full_reference_iqa, is_pairwise, need_
 
     else:
         if is_full_reference_iqa:
-            q, patches_ref, patches_dist, patches_pos = data[:4]
+            q, patches_ref, patches_dist, patches_pos, patches_scales = data[:5]
             patches = (patches_ref, patches_dist)
         else:
-            q, patches_dist, patches_pos = data[:3]
+            q, patches_dist, patches_pos, patches_scales = data[:4]
             patches = (patches_dist,)
 
         if need_pos_input:
-            q_p = model(patches, patches_pos)
+            q_p = model(patches, patches_pos, patches_scales)
         else:
             q_p = model(patches)
 
@@ -288,12 +288,12 @@ def main():
     is_verbose = global_config["is_verbose"]
     is_pairwise = global_config["dataset"] == DATASET_PIEAPP_TRAIN
 
-    is_vtamiq = global_config["model"] == MODEL_VTAMIQ
+    is_vtamiq = global_config["model"] == MODEL_VTAMIQ or global_config["model"] == MODEL_VTAMIQp2b
     is_lpips = global_config["model"] == MODEL_LPIPS
 
     is_full_reference_iqa = not DATASET_TO_USE() == "KONIQ10k" and dataset_config_base["full_reference"]
 
-    need_pos_input = global_config["model"] == "SIQ-G" or is_vtamiq  # need to be passed pos info on forward() call
+    need_pos_input = is_vtamiq  # need to be passed pos info on forward() call
 
     checkpoint_file = global_config["load_checkpoint_file"]
 
@@ -334,7 +334,7 @@ def main():
         # 1. not loading a pretrained VTAMIQ
         # 2. fine-tuning on a dataset with a VTAMIQ model pretrained on another dataset
         need_freeze_transformer = \
-            vtamiq_runtime_config["allow_freeze_vit"] and \
+            vtamiq_runtime_config["vtamiq_allow_freeze"] and \
             (checkpoint_file is None or DATASET_TO_USE() not in checkpoint_file)
 
         # need_freeze_transformer = False  # OVERRIDE
@@ -403,8 +403,14 @@ def main():
 
     if is_vtamiq and need_freeze_transformer:
         # freeze VTAMIQ transformer
-        model.set_freeze_state(True, vtamiq_runtime_config["allow_freeze_embeddings"])
-        logger("VTAMIQ: Freezing transformer and diff_net.")
+        model.set_freeze_state(True,
+                               diffnet=vtamiq_runtime_config["diffnet_freeze"],
+                               encoder=vtamiq_runtime_config["freeze_encoder"],
+                               embed_patch=vtamiq_runtime_config["freeze_embeddings_patch"],
+                               embed_pos=vtamiq_runtime_config["freeze_embeddings_pos"],
+                               embed_scale=vtamiq_runtime_config["freeze_embeddings_scale"],
+                               )
+        logger("VTAMIQ: Froze parameters...")
 
     global_step_train = 0
     global_step_val = 0
@@ -499,7 +505,7 @@ def main():
     def writer_log_losses_pairwise(split_name, loss, step):
         writer.add_scalar(split_name, "mae_loss", loss, step)
 
-    def do_training(split_name, loader, step):
+    def do_training(scaler, split_name, loader, step):
         # Enable training mode (automatic differentiation + batch norm)
         model.train()
 
@@ -510,20 +516,20 @@ def main():
             # Compute gradients for the batch
             optimizer.zero_grad()
 
-            q, q_p = model_predict(model, data, device, is_full_reference_iqa, is_pairwise, need_pos_input)
+            with torch.cuda.amp.autocast():
+                q, q_p = model_predict(model, data, device, is_full_reference_iqa, is_pairwise, need_pos_input)
+                batch_size = q.shape[0]
 
-            batch_size = q.shape[0]
+                if is_pairwise:
+                    loss = mse_loss(q_p, q)
+                else:
+                    loss, loss_mae, loss_rank, loss_pears = loss_func(q_p, q, batch_size)
 
-            if is_pairwise:
-                loss = mse_loss(q_p, q)
-            else:
-                loss, loss_mae, loss_rank, loss_pears = loss_func(q_p, q, batch_size)
-
-            loss.backward()
-
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             if is_lpips:
                 model.clamp_weights()
@@ -548,7 +554,7 @@ def main():
         # compute statistics over validation results
         return step, compute_scores(ys, yp)
 
-    def do_validation(split_name, loader, step, log_writer=True, save_test_outputs=False):
+    def do_validation(scaler, split_name, loader, step, log_writer=True, save_test_outputs=False):
         if global_config["save_test_outputs"]:
             test_logger = FileLogger(output_dir + "/" + global_config["save_test_outputs_txt"])
         y = []
@@ -557,13 +563,14 @@ def main():
             model.eval()
             # loop over validation data
             for i, data in enumerate(tqdm(loader)):
-                q, q_p = model_predict(model, data, device, is_full_reference_iqa, is_pairwise, need_pos_input)
+                with torch.cuda.amp.autocast():
+                    q, q_p = model_predict(model, data, device, is_full_reference_iqa, is_pairwise, need_pos_input)
 
-                if is_pairwise:
-                    loss = mae_loss(q_p, q)
-                else:
-                    batch_size = q.shape[0]
-                    loss, loss_mae, loss_rank, loss_pears = loss_func(q_p, q, batch_size)
+                    if is_pairwise:
+                        loss = mae_loss(q_p, q)
+                    else:
+                        batch_size = q.shape[0]
+                        loss, loss_mae, loss_rank, loss_pears = loss_func(q_p, q, batch_size)
 
                 y.append(q.cpu())
                 yp.append(q_p.cpu())
@@ -592,9 +599,9 @@ def main():
 
         return step, cor
 
-    def do_split_loop(split_name, loader, step, best_spearman, is_train=True, do_logs=True):
+    def do_split_loop(scaler, split_name, loader, step, best_spearman, is_train=True, do_logs=True):
         do_split_func = do_training if is_train else do_validation
-        step, correlations = do_split_func(split_name, loader, step)  # complete pass over the entire loader
+        step, correlations = do_split_func(scaler, split_name, loader, step)  # complete pass over the entire loader
         spearman, kendall, pearson, rmse = correlations
 
         if do_logs and not is_debug:
@@ -628,6 +635,8 @@ def main():
             RMSE_FIELD: rmse,
         }
 
+    scaler = torch.cuda.amp.GradScaler()
+
     best_spearman_train = Max()
     best_spearman_val = Max()
 
@@ -639,10 +648,10 @@ def main():
         logger("Beginning epoch {:03d}".format(epoch))
 
         # check if need unfreeze VTAMIQ
-        if is_vtamiq and vtamiq_runtime_config["allow_freeze_vit"] and epoch > freeze_end_epoch:
+        if is_vtamiq and vtamiq_runtime_config["vtamiq_allow_freeze"] and epoch > freeze_end_epoch:
             logger("VTAMIQ: Unfreezing transformer layers.")
-            model.set_freeze_state(False, vtamiq_runtime_config["allow_frteeze_embeddings"])
-            vtamiq_runtime_config["allow_freeze_vit"] = False  # remove this flag to prevent calling this clause again
+            model.set_freeze_state(False)
+            vtamiq_runtime_config["vtamiq_allow_freeze"] = False  # remove this flag to prevent calling this clause again
 
         # default parameters
         split_name = "missing"
@@ -653,14 +662,14 @@ def main():
             print("Starting Training loop...")
             split_name = SPLIT_NAME_TRAIN
             global_step_train, spearman, is_best_so_far, correlations = \
-                do_split_loop(split_name, train_loader, global_step_train, best_spearman_train, is_train=True)
+                do_split_loop(scaler, split_name, train_loader, global_step_train, best_spearman_train, is_train=True)
             results = get_results_dict(*correlations)
 
         if global_config["do_val"]:
             print("Starting Validation loop...")
             split_name = SPLIT_NAME_VAL
             global_step_val, spearman, is_best_so_far, correlations = \
-                do_split_loop(split_name, val_loader, global_step_val, best_spearman_val, is_train=False)
+                do_split_loop(scaler, split_name, val_loader, global_step_val, best_spearman_val, is_train=False)
             results = get_results_dict(*correlations)
 
         logger("Completed epoch {}".format(epoch))
@@ -692,15 +701,16 @@ def main():
         if global_config["do_train"]:
             model = get_model(device, is_full_reference_iqa, "{}/best.pth".format(output_dir))
 
-        step, correlations = do_validation(SPLIT_NAME_TEST, test_loader, 0, log_writer=False, save_test_outputs=True)
+        step, correlations = do_validation(scaler, SPLIT_NAME_TEST, test_loader, 0, log_writer=False, save_test_outputs=True)
         spearman, kendall, pearson, rmse = correlations
 
+        # logger('Test split:', test_loader.dataset.splits_dict[SPLIT_NAME_TEST].indices)
         logger('Test stats:\n' +
                '{}={}\n'.format(SROCC_FIELD, spearman) +
                '{}={}\n'.format(KROCC_FIELD, kendall) +
                '{}={}\n'.format(PLCC_FIELD, pearson) +
                '{}={}\n'.format(RMSE_FIELD, rmse)
-        )
+               )
 
         results = get_results_dict(*correlations)
 

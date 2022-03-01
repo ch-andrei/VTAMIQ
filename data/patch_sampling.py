@@ -12,7 +12,6 @@ class PatchSampler(object):
                  diffbased_weight=0.,
                  uniform_weight=1.,
                  diffbased_pow=2,
-                 prenormalize=True
                  ):
         """
         class to generate i,j coordinates for sampling patches from a 2D image
@@ -25,7 +24,6 @@ class PatchSampler(object):
         self.centerbias_weight = max(0., centerbias_weight)
         self.diffbased_weight = max(0., diffbased_weight)
         self.diffbased_pow = diffbased_pow
-        self.prenormalize = prenormalize
 
         total_weight = self.uniform_weight + self.diffbased_weight + self.centerbias_weight
         assert total_weight != 0, "Must specify non-zero weights."
@@ -33,11 +31,10 @@ class PatchSampler(object):
         if self.centerbias_weight > 0:
             self.centerbias_template = np.load(self.__centerbias_image_path__)
 
-    def __call__(self, h, w, ho, wo, imgs=None, num_samples=1):
-        # return self.get_sample_params(h, w, ho, wo, imgs, num_samples)
-        return self.get_sample_params(h, w, ho, wo, imgs, num_samples)
+    def __call__(self, h, w, ho, wo, diff=None, num_samples=1):
+        return self.get_sample_params(h, w, ho, wo, diff=diff, num_samples=num_samples)
 
-    def get_sample_params(self, h, w, ho, wo, imgs=None, num_samples=1):
+    def get_sample_params(self, h, w, ho, wo, diff=None, num_samples=1):
         if self.diffbased_weight == 0 and self.centerbias_weight == 0:
             # stratified grid with equal probability for each cell
             return stratified_grid_sampling(h, w, ho, wo, sample_prob=np.ones((h, w)), num_samples=num_samples)
@@ -51,28 +48,14 @@ class PatchSampler(object):
             diffbased = 0
             # compute diffbased component
             if self.diffbased_weight > 0:
-                assert imgs is not None, "PatchSampler: 'imgs' input must be specified for difference based sampling."
+                assert diff is not None, "PatchSampler: 'diff' input must be specified for difference-based sampling."
 
-                def pil2np(img):
-                    im = np.array(img).astype(float)
-                    if self.prenormalize:
-                        im -= im.min()
-                        im /= im.max()
-                    return im
-
-                ref_img = pil2np(imgs[0])
-                diff = np.zeros_like(ref_img)
-                for dist_img in imgs[1:]:
-                    dist_img = pil2np(dist_img)
-                    diff += np.abs(ref_img - dist_img)
-                diff = diff / (len(imgs) - 1)  # average the difference
-
-                diffbased = np.abs(diff)
+                diffbased = diff.copy()
 
                 pow = self.diffbased_pow
-                if len(diffbased.shape) > 2:
+                if len(diff.shape) > 2:
                     diffbased = np.sum(diffbased * diffbased, axis=2)  # L2 distance over color channels
-                    pow = pow / 2
+                    pow = pow - 1
 
                 diffbased = np.power(diffbased, pow)
 
@@ -81,7 +64,6 @@ class PatchSampler(object):
                 else:
                     diffbased = 0
 
-            # add uniform weight
             sample_prob = self.centerbias_weight * centerbias + \
                           self.diffbased_weight * diffbased + \
                           self.uniform_weight
@@ -135,12 +117,14 @@ def halton_sequence_2d(n):
 
 def stratified_grid_sampling(h, w, ho, wo, sample_prob=None, num_samples=1, num_samples_cell=4):
     __cells_r_min = 4  # minimum number of cells across max(h,w)
-    __cellsize_ratio_min = 0.025  # minimum cell size: max(h,w) / ratio (in pixels); note: scales with image size
+    __cellsize_ratio_min = 0.5  # minimum cell size relative to extracted patch size
 
     aspect_ratio = max(h, w) / min(h, w)
     num_cells_r = max(__cells_r_min, num_samples / num_samples_cell / num_samples_cell / aspect_ratio)
 
-    cell_size = int(max(max(h, w) * __cellsize_ratio_min, max(h, w) // num_cells_r))
+    cell_size = int(max(4, max(min(ho, wo) * __cellsize_ratio_min, min(64, max(h, w) // num_cells_r))))
+
+    # print('stratified_grid_sampling', h, w, ho, wo, cell_size, num_samples)
 
     # step size in the original array
     sh = int(np.ceil((h - ho) / cell_size))
@@ -205,7 +189,7 @@ def stratified_grid_sampling(h, w, ho, wo, sample_prob=None, num_samples=1, num_
         patches[1] = (i + halton_seq_w) * cell_size
 
         for k in range(num_patches_c):
-            samples.append((patches[0, k], patches[1, k], ho, wo))
+            samples.append((patches[0, k], patches[1, k]))
 
         patches_tot += num_patches_c
 

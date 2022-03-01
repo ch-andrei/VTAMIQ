@@ -14,8 +14,10 @@ DATASET_CSIQ = "CSIQ"
 DATASET_PIEAPP_TEST = "PieAPPTestset"
 DATASET_PIEAPP_TRAIN = "PieAPPTrainset"
 DATASET_PIPAL = "PIPAL"
-DATASET_PIPAL_TEST = "PIPALTest"
 DATASET_PIPAL_VAL = "PIPALVal"
+DATASET_PIPAL_VAL22 = "PIPALVal22"
+DATASET_PIPAL_TEST = "PIPALTest"
+DATASET_PIPAL_TEST22 = "PIPALTest22"
 DATASET_KADID10K = "KADID10k"
 DATASET_KONIQ10K = "KONIQ10k"
 DATASET_KADIS700k = "KADIS700k"
@@ -37,7 +39,11 @@ KROCC_FIELD = 'KROCC'
 PLCC_FIELD = 'PLCC'
 RMSE_FIELD = 'RMSE'
 
+MODEL_SIQ = "SIQ"
+MODEL_SIQG = "SIQG"
+MODEL_SIQL = "SIQL"
 MODEL_VTAMIQ = "VTAMIQ"
+MODEL_VTAMIQp2b = "VTAMIQp2b"
 MODEL_LPIPS = "LPIPS"
 MODEL_PIEAPP = "PIEAPP"
 
@@ -126,40 +132,39 @@ global_config = OrderedDict(
 
 # ************** CONFIGURATION FOR MODELS **************
 
-resnet_config = OrderedDict(
-    pretrained=False,
-)
-
 vtamiq_config = OrderedDict(
     num_residual_groups=4,
     num_rcabs_per_group=4,
     dropout=0.2,
 
-    use_fourier_embeddings=False,  # Fourier Features
     use_diff_embedding=False,  # reference image aware difference modulation
 
     vit_variant="B16",  # choose from ["B16", "L16"]
     vit_num_keep_layers=6,  # -1 for keeping all layers
+    vit_use_scale_embedding=True,  # toggle to use scale embedding for ViT
 )
-
 vtamiq_runtime_config = OrderedDict(
     # there are two stages to pretraining VTAMIQ:
     # i) pretrain only ViT on ImageNet,
-    # ii) pretrain the complete KADIS-700k
+    # ii) pretrain the complete VTAMIQ on KADIS-700k
 
     # toggle whether using pretrained ViT (Imagenet) is allowed
-    allow_pretrained_vit=True,
+    allow_pretrained_weights=True,
 
     # if using pretrained VTAMIQ (not just pretrained ViT), toggle whether loading ViT or Diffnet weights is allowed
-    allow_load_model_vit=True,
-    allow_load_model_diffnet=True,
+    allow_pretrained_weights_vit=True,
+    allow_pretrained_weights_diffnet=True,
 
     # Note: freezing features is useful when quality predictor is untrained, but pretrained ViT is used.
     # We don't want to overwrite pretrained BERT features while quality predictor is outputting garbage.
     # Instead, freeze the transformer, spend several epochs training quality predictor, then unfreeze the transformer
     # for combined fine-tuning.
-    allow_freeze_vit=False,
-    allow_freeze_embeddings=True,
+    vtamiq_allow_freeze=False,  # global toggle to allow freezing
+    diffnet_freeze=False,
+    freeze_encoder=True,  # ViT encoder
+    freeze_embeddings_patch=True,  # ViT patch embeddings
+    freeze_embeddings_pos=False,  # ViT positional embeddings
+    freeze_embeddings_scale=False,  # ViT scale embeddings
 
     # when to end freezing ViT weights (based on dataset)
     freeze_end_epoch={
@@ -168,13 +173,15 @@ vtamiq_runtime_config = OrderedDict(
         DATASET_LIVE: 3,
         DATASET_CSIQ: 2,
         DATASET_PIPAL: 1,
-        DATASET_PIPAL_TEST: 0,
         DATASET_PIPAL_VAL: 0,
-        DATASET_PIEAPP_TEST: 1,
+        DATASET_PIPAL_VAL22: 0,
+        DATASET_PIPAL_TEST: 0,
+        DATASET_PIPAL_TEST22: 0,
         DATASET_PIEAPP_TRAIN: 1,
+        DATASET_PIEAPP_TEST: 0,
         DATASET_KADID10K: 1,
         DATASET_KONIQ10K: 1,
-        DATASET_KADIS700k: 0,
+        DATASET_KADIS700k: 1,
     }
 )
 
@@ -190,6 +197,7 @@ dataset_config_base = OrderedDict(
     resolution="half",  # only relevant for KONIQ10k dataset, otherwise ignored
 
     patch_dim=16,
+    patch_num_scales=5,  # 16, 32, 64, 128, 256...
 
     normalize=True,
     normalize_imagenet=True,
@@ -235,7 +243,7 @@ tid2013_split_config = {
     SPLIT_TYPE_INDICES: {
         SPLIT_NAME_TRAIN: [i for i in range(15)],
         SPLIT_NAME_VAL: [i for i in range(15, 20)],
-        SPLIT_NAME_TEST: [i for i in range(25)],
+        SPLIT_NAME_TEST: [i for i in range(20, 25)],
     },
 }
 
@@ -251,7 +259,7 @@ live_split_config = {
     SPLIT_TYPE_INDICES: {
         SPLIT_NAME_TRAIN: [i for i in range(17)],
         SPLIT_NAME_VAL: [i for i in range(17, 23)],
-        SPLIT_NAME_TEST: [i for i in range(29)],
+        SPLIT_NAME_TEST: [i for i in range(23, 29)],
     },
 }
 
@@ -264,7 +272,7 @@ csiq_split_config = {
     SPLIT_TYPE_INDICES: {
         SPLIT_NAME_TRAIN: [i for i in range(18)],
         SPLIT_NAME_VAL: [i for i in range(18, 24)],
-        SPLIT_NAME_TEST: [i for i in range(30)],
+        SPLIT_NAME_TEST: [i for i in range(24, 30)],
     },
 }
 
@@ -277,7 +285,7 @@ pieapptrain_split_config = {
     SPLIT_TYPE_INDICES: {
         SPLIT_NAME_TRAIN: [i for i in range(120)],
         SPLIT_NAME_VAL: [i for i in range(120, 140)],
-        SPLIT_NAME_TEST: [i for i in range(140)],
+        SPLIT_NAME_TEST: [i for i in range(140)],  # not used
     },
 }
 
@@ -288,9 +296,9 @@ pieapptest_split_config = {
         SPLIT_NAME_TEST: 8,
     },
     SPLIT_TYPE_INDICES: {
-        SPLIT_NAME_TRAIN: [i for i in range(24)],
-        SPLIT_NAME_VAL: [i for i in range(24, 32)],
-        SPLIT_NAME_TEST: [i for i in range(40)],
+        SPLIT_NAME_TRAIN: [i for i in range(24)],  # not used
+        SPLIT_NAME_VAL: [i for i in range(24, 32)],  # not used
+        SPLIT_NAME_TEST: [i for i in range(40)],  # whole dataset is test
     },
 }
 
@@ -303,7 +311,7 @@ pipal_split_config = {
     SPLIT_TYPE_INDICES: {
         SPLIT_NAME_TRAIN: [i for i in range(120)],
         SPLIT_NAME_VAL: [i for i in range(120, 160)],
-        SPLIT_NAME_TEST: [i for i in range(200)],
+        SPLIT_NAME_TEST: [i for i in range(160, 200)],
         },
 }
 
@@ -314,9 +322,9 @@ pipaltest_split_config = {
         SPLIT_NAME_TEST: 25,
     },
     SPLIT_TYPE_INDICES: {
-        SPLIT_NAME_TRAIN: [i for i in range(15)],
-        SPLIT_NAME_VAL: [i for i in range(15, 20)],
-        SPLIT_NAME_TEST: [i for i in range(25)]},
+        SPLIT_NAME_TRAIN: [i for i in range(15)],  # not used
+        SPLIT_NAME_VAL: [i for i in range(15, 20)],  # not used
+        SPLIT_NAME_TEST: [i for i in range(25)]},  # whole dataset is test
 }
 
 kadid10k_split_config = {
@@ -328,7 +336,7 @@ kadid10k_split_config = {
     SPLIT_TYPE_INDICES: {  # 49, 4
         SPLIT_NAME_TRAIN: [i for i in range(0, 49)],
         SPLIT_NAME_VAL: [i for i in range(49, 65)],
-        SPLIT_NAME_TEST: [i for i in range(81)],
+        SPLIT_NAME_TEST: [i for i in range(65, 81)],
     },
 }
 
@@ -356,7 +364,7 @@ koniq10k_split_config = {
     SPLIT_TYPE_INDICES: {
         SPLIT_NAME_TRAIN: [i for i in range(6045)],
         SPLIT_NAME_VAL: [i for i in range(6045, 8059)],
-        SPLIT_NAME_TEST: [i for i in range(10073)],
+        SPLIT_NAME_TEST: [i for i in range(8059, 10073)],
     },
 }
 
@@ -411,6 +419,11 @@ def get_dataset_configs(dataset_name):
     elif dataset_name == DATASET_PIPAL_VAL:
         from data.datasets.pipal import PIPALVal
         dataset_type = PIPALVal
+        splits_config = pipaltest_split_config  # same config as Test
+
+    elif dataset_name == DATASET_PIPAL_VAL22:
+        from data.datasets.pipal import PIPALVal22
+        dataset_type = PIPALVal22
         splits_config = pipaltest_split_config  # same config as Test
 
     elif dataset_name == DATASET_PIPAL_TEST:
@@ -557,7 +570,7 @@ def store_config_files(output_dir):
         dump(koniq10k_split_config, "koniq10k_dataset_config")
     elif is_used(DATASET_PIPAL):
         dump(pipal_split_config, "pipal_split_config")
-    elif is_used(DATASET_PIPAL_TEST) or is_used(DATASET_PIPAL_VAL):
+    elif is_used(DATASET_PIPAL_TEST) or is_used(DATASET_PIPAL_VAL) or is_used(DATASET_PIPAL_VAL22):
         dump(pipaltest_split_config, "pipaltest_split_config")
     elif is_used(DATASET_CSIQ):
         dump(csiq_split_config, "csiq_split_config")
@@ -587,14 +600,13 @@ def validate_configs():
                 dataset == DATASET_KONIQ10K or \
                 dataset == DATASET_KADIS700k or \
                 dataset == DATASET_PIPAL or \
-                dataset == DATASET_PIPAL_TEST or \
                 dataset == DATASET_PIPAL_VAL or \
+                dataset == DATASET_PIPAL_VAL22 or \
+                dataset == DATASET_PIPAL_TEST or \
+                dataset == DATASET_PIPAL_TEST22 or \
                 dataset == DATASET_PIEAPP_TRAIN:
             global_config["dataloader_num_workers"] = 8
         print("Setting global_config[dataloader_num_workers]={}".format(global_config["dataloader_num_workers"]))
 
         if dataset == DATASET_PIEAPP_TRAIN:
             print("WARNING: using Pairwise training mode.")
-
-    if vtamiq_config["use_fourier_embeddings"]:
-        print("WARNING: using Fourier embeddings for VTAMIQ.")

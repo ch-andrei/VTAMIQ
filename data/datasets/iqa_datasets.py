@@ -104,13 +104,13 @@ class FRIqaPatchDataset(PatchDataset):
         tensor_ref = transform_pil(img_ref, None, r_flip, (norm_mean, norm_std))
         tensor_dist = transform_pil(img_dist, None, r_flip, (norm_mean, norm_std))
 
-        patches_tuple = get_iqa_patches(
+        p1, p2, pos, scales = get_iqa_patches(
             (img_ref, img_dist),
             (tensor_ref, tensor_dist),
-            self.patch_count, self.patch_dim, self.patch_sampler
+            self.patch_count, self.patch_dim, self.patch_sampler, self.patch_num_scales
         )
 
-        return q, patches_tuple
+        return q, p1, p2, pos, scales
 
 
 class PairwiseFRIqaPatchDataset(FRIqaPatchDataset):
@@ -153,28 +153,27 @@ class PairwiseFRIqaPatchDataset(FRIqaPatchDataset):
         tensor_dist1 = transform_pil(img_dist1, None, r_flip, (norm_mean, norm_std))
         tensor_dist2 = transform_pil(img_dist2, None, r_flip, (norm_mean, norm_std))
 
-        patches_tuple = get_iqa_patches(
+        p1, p2, p3, pos, scales = get_iqa_patches(
             (img_ref, img_dist1, img_dist2),
             (tensor_ref, tensor_dist1, tensor_dist2),
-            self.patch_count, self.patch_dim, self.patch_sampler
+            self.patch_count, self.patch_dim, self.patch_sampler, self.patch_num_scales
         )
 
-        return q, patches_tuple
+        return q, p1, p2, p3, pos, scales
 
     def process_data(self, data):
         # do nothing, since we are dealing with preferences, there is no need to preprocess Qs
         return data
 
 
-# TODO: modify this
-# class NRIqaPatchDataset(FRIqaPatchDataset):
-#     def __init__(self, **kwargs):
-#         if "full_reference" in kwargs:
-#             print("Warning: full_reference arg can't be modified for NR-IQA dataset. Setting full_reference=False")
-#
-#         # force full_reference off
-#         kwargs["full_reference"] = False
-#
-#         super(NRIqaPatchDataset, self).__init__(
-#             **kwargs
-#         )
+class NRIqaPatchDataset(FRIqaPatchDataset):
+    def __init__(self, **kwargs):
+        if "full_reference" in kwargs:
+            print("Warning: full_reference arg can't be modified for NR-IQA dataset. Setting full_reference=False")
+
+        # force full_reference off
+        kwargs["full_reference"] = False
+
+        super(NRIqaPatchDataset, self).__init__(
+            **kwargs
+        )
