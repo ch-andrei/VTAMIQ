@@ -148,21 +148,13 @@ def get_model(device, is_full_reference, checkpoint_file=None):
                     if layer_name.contains(layer_prefix):
                         model_state_dict.pop(layer_name)
 
-            if not vtamiq_runtime_config["allow_load_model_vit"]:
+            if not vtamiq_runtime_config["allow_pretrained_weights_vit"]:
                 print("Will not load transformer weights from checkpoint file.")
                 pop_layers_fromn_model_state_dict("transformer.")
 
-            if not vtamiq_runtime_config["allow_load_model_diffnet"]:
+            if not vtamiq_runtime_config["allow_pretrained_weights_diffnet"]:
                 print("Will not load diffnet weights from checkpoint file.")
                 pop_layers_fromn_model_state_dict("diffnet.")
-
-    elif model == MODEL_LPIPS:
-        from modules.lpips.lpips_model import LPIPSm
-        model = LPIPSm()
-
-    elif model == MODEL_PIEAPP:
-        from modules.PerceptualImageError.model.PieAPPv0pt1_PT import PieAPP
-        model = PieAPP()
 
     else:
         raise TypeError("[{}] model is unsupported.".format(model))

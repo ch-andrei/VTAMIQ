@@ -221,9 +221,9 @@ dataloader_config = {
         PATCH_RFLIP: True,
     },
     SPLIT_NAME_VAL: {
-        BATCH_SIZE: 60,
+        BATCH_SIZE: 40,
         SHUFFLE: False,
-        PATCH_COUNT: 512,
+        PATCH_COUNT: 1024,
         PATCH_RFLIP: False,
     },
     SPLIT_NAME_TEST: {

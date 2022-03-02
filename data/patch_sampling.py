@@ -3,6 +3,9 @@ from scipy.ndimage import zoom
 from scipy.special import logsumexp
 from skimage.util.shape import view_as_windows
 
+import torch
+import torch.nn as nn
+
 
 class PatchSampler(object):
     __centerbias_image_path__ = "./modules/Attention/deepgaze2/centerbias.npy"
@@ -194,3 +197,140 @@ def stratified_grid_sampling(h, w, ho, wo, sample_prob=None, num_samples=1, num_
         patches_tot += num_patches_c
 
     return samples
+
+
+def compute_diff(pil_imgs):
+    def pil2np(img, prenormalize=True):
+        im = np.array(img).astype(float)
+        if prenormalize:
+            im -= im.min()
+            im /= im.max()
+        return im
+
+    imgs_np = [pil2np(img) for img in pil_imgs]
+
+    # compute difference
+    ref_img = imgs_np[0]
+    diff = np.zeros_like(ref_img)
+    for dist_img in imgs_np[1:]:
+        diff += np.abs(ref_img - dist_img)
+
+    return diff / (len(imgs_np) - 1)  # average the difference
+
+
+def compute_patch_scales(patch_num_scales, h, w, ho, wo):
+    patch_dim_m = max(ho, wo)
+    if 1 < patch_num_scales:
+        # determine how many scales are possible
+        dim_max = min(h, w)
+        patch_num_scales_max = 1
+        while True:
+            dim_max = (dim_max - patch_dim_m) / 2
+            if dim_max <= 1:  # stop at one less than max number
+                break
+            patch_num_scales_max += 1
+        patch_num_scales = min(patch_num_scales_max, patch_num_scales)
+    else:
+        patch_num_scales = 1
+    return patch_num_scales
+
+
+def compute_num_samples(patch_count, patch_num_scales, scale_num_samples_ratio):
+    num_samples = 2 ** (scale_num_samples_ratio * np.arange(patch_num_scales))
+    num_samples = np.ceil(num_samples * patch_count / np.sum(num_samples)).astype(int)
+    cum_samples = np.cumsum(num_samples)
+    for i in range(patch_num_scales):
+        if patch_count <= cum_samples[i]:
+            num_samples[i] -= cum_samples[i] - patch_count
+            num_samples[i+1:] = 0
+            break
+    return num_samples
+
+
+def get_iqa_patches(imgs: tuple,
+                    tensors: tuple,
+                    patch_count,
+                    patch_dim,
+                    patch_sampler,
+                    patch_num_scales,
+                    scale_num_samples_ratio=1.5
+                    ):
+    """
+    returns a tuple with patch_data and patch positions. Supports FR and NR IQA.
+    :param imgs: tuple of images, FR-IQA uses 2 images (ref. and dist. images) else only 1 for NR-IQA
+    :param patch_count: how many patch_data per images
+    :param patch_dim: patch dimensions
+    :param patch_sampler: patch sampler to use
+    :param patch_num_scales: how many different scales to extract
+    :param scale_num_samples_ratio: used to compute number of patches per scale, higher values lead to less patches for large scales
+    :return:
+    """
+    assert len(imgs) == len(tensors), "get_iqa_patches(): Image and Tensor counts should match."
+    assert patch_num_scales <= patch_count, "get_iqa_patches(): number of patches must be at least number of scales."
+
+    height, width = imgs[0].height, imgs[0].width
+
+    # precompute patch order
+    patch_indices = np.arange(patch_count)
+    np.random.shuffle(patch_indices)
+
+    diff = compute_diff(imgs)
+    patch_num_scales = compute_patch_scales(patch_num_scales, height, width, patch_dim[0], patch_dim[1])
+    num_samples = compute_num_samples(patch_count, patch_num_scales, scale_num_samples_ratio)
+
+    mean_pooler = nn.AvgPool2d(kernel_size=2)  # 2x downsampler
+    patches = torch.zeros((len(imgs), patch_count, 3) + (patch_dim[0], patch_dim[1]))
+    positions = torch.zeros((patch_count, 2))
+    scales = torch.zeros((patch_count, 2))
+    num_samples_total = 0
+    for scale in range(patch_num_scales):
+        num_samples_s = num_samples[-scale-1]
+
+        h, w = diff.shape[:2]
+
+        samples = patch_sampler.get_sample_params(
+            h, w,
+            patch_dim[0], patch_dim[1],
+            diff=diff,
+            num_samples=num_samples_s,
+        )  # N x 2
+
+        patches_pos = np.array(samples) + np.array([patch_dim[0]//2, patch_dim[1]//2], float).reshape(1, 2)  # 3. patch centers
+        patches_pos = patches_pos / np.array([h - patch_dim[0]//2, w - patch_dim[1]//2], float).reshape(1, 2)  # 3. rescale to [0, 1]
+        patches_pos = torch.clamp(torch.as_tensor(patches_pos), 0., 1. - 1e-6)  # 3.
+
+        patches_scale = torch.zeros_like(patches_pos)
+        patches_scale[:, 0] = scale  # 1. simply the scale number
+        patches_scale[:, 1] = scale  # 1.
+
+        # extract patches
+        patch_indices_s = patch_indices[num_samples_total: num_samples_total + num_samples_s]
+
+        def tensor2patches(k):
+            for patch_num, (i, j) in enumerate(samples):
+                patch_num = patch_indices_s[patch_num]  # get randomized patch order
+                patches[k, patch_num] = tensor[:, i: i + patch_dim[0], j: j + patch_dim[1]]
+
+        # convert patch_data to tensors and add to output tuple
+        for k, tensor in enumerate(tensors):
+            tensor2patches(k)
+
+        positions[num_samples_total: num_samples_total + num_samples_s] = patches_pos
+        scales[num_samples_total: num_samples_total + num_samples_s] = patches_scale
+
+        # downsample for the next scale
+        tensors = [mean_pooler(tensor) for tensor in tensors]
+        diff = torch.permute(mean_pooler(torch.permute(torch.as_tensor(diff), (2, 0, 1))), (1, 2, 0)).numpy()
+        num_samples_total += num_samples_s
+
+        # sanity check
+        if patch_count <= num_samples_total:
+            break
+
+    # output tuple format: (p1, ..., pN, positions, scales)
+    data_tuple = tuple()
+    for k, tensor in enumerate(tensors):
+        data_tuple += (patches[k], )
+    data_tuple += (positions, scales)
+
+    return data_tuple

@@ -2,7 +2,8 @@ from PIL import Image
 import numpy as np
 import torch
 
-from data.utils import transform as transform_pil, get_iqa_patches
+from data.utils import transform as transform_pil
+from data.patch_sampling import get_iqa_patches
 from data.patch_datasets import PatchDataset
 
 
