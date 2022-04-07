@@ -12,6 +12,19 @@ Andrei Chubarau and James Clark. 2021,
 
 We provide training and testing code for various popular FR IQA datasets.
 
+Please cite as:
+
+```
+@article{vtamiq2021,
+  title={VTAMIQ: Transformers for Attention Modulated Image Quality Assessment},
+  author={Chubarau, Andrei and Clark, James},
+  journal = {CoRR},
+  volume = {abs/2110.01655},
+  year={2021},
+  url = {https://arxiv.org/abs/2110.01655}
+}
+```
+
 ## Paper Abstract
 
 Following the major successes of self-attention and Transformers for image analysis, 
@@ -32,7 +45,7 @@ further demonstrating the strength of transformer-based networks for vision mode
 
 <img src='https://github.com/ch-andrei/VTAMIQ/blob/main/figures/vtamiq_diagram_compact.png' width=1200>
 
-VTAMIQ uses a Vision Transformer (ViT) [1] modified for custom patches extraction
+VTAMIQ uses a Vision Transformer (ViT) [1] modified for sparse patch extraction
 to encode each input image as a single latent representation, computes the difference 
 between the encoded representations for the reference and the distorted images, 
 intelligently modulates this difference (DiffNet), and finally, 
@@ -61,13 +74,27 @@ patch sampling (CAPS) scheme. CAPS allows us to train VTAMIQ faster and with few
 CAPS relies on probabilistic sampling to extract N patches from the input images.
 We define pixelwise sampling probabilities based on a normalized weighted sum of three components:
 i) a measure of perceptual difference between the reference and the test images (e.g., MSE, SSIM),
-ii) centerbias, iii) uniform. We then rescale the components to range [0,1] and compute a weighted average.
+ii) centerbias, iii) uniform. We then rescale the components to range [0,1] and compute a weighted average with 
+configurable weight parameters.
+
+We further implement stratified sampling to decrease the variance and improve the uniformity of the extracted patches. 
+The sampling probability is discretized into a grid of KxK blocks; block size is adaptive to input image resolution.
+Each block is then allocated an appropriate number of samples given the combined probability.
+
+We showcase CAPS with 50, 500, and 5000 patches below:
+<img src='https://github.com/ch-andrei/VTAMIQ/blob/main/figures/patch_sampling-singlescale.png' width=1200>
+
+To allow for IQA for high resolution images, we may further extract patches at multiple scales. 
+The sampling scheme is applied for each scale independently. We first sample at the original resolution, 
+then downscale and sample again. This procedure can be repeated until the desired number of scales is used.
+<img src='https://github.com/ch-andrei/VTAMIQ/blob/main/figures/patch_sampling-multiscale.png' width=1200>
+
+Note that we reduce the number of patches for larger scales such that the overall pixel coverage is approximately
+uniform for every scale. For instance, using 16x16, 32x32, and 64x64: a single 32x32 patch contains 4 16x16 patches; 
+64x64 contains 4 32x32 or 16 16x16 patches; therefore, we set the patch counts as per the ratio 16:4:1 to match the 
+number of pixels for each scale.
+
 See ./data/patch_sampling.py for more information.
-
-We illustrate a set of 10000 patches generated with CAPS below. 
-Note that we purposefully select a large number of patches for a more adequate visualization.
-
-<img src='https://github.com/ch-andrei/VTAMIQ/blob/main/figures/patch_sampling.png' width=1200>
 
 ### ViT modified for CAPS
 
@@ -79,6 +106,12 @@ To allow for full reuse of pre-trained ViT, we use the positional <i>uv</i> coor
 
 <img src='https://github.com/ch-andrei/VTAMIQ/blob/main/figures/vtamiq_vit_diagram_compact.png' width=400>
 
+We complement positional embeddings with Scale Embeddings (SE) following the strategy presented by MUSIQ 
+(Multi-scale Image Quality Transformer) [3]. We extract multi-scale patches as described above, and downsample 
+to 16x16 resolution to allow all patches to be processed in parallel (by ViT) as a single sequence.
+
+The final embeddings (before passing through the transformer) consist of the sum of Patch, Positional, and Scale embeddings. 
+
 ## Training Details
 
 For our best performance, we train VTAMIQ in several stages.
@@ -88,9 +121,6 @@ Firstly, we use a Vision Transformer (ViT) pre-trained on ImageNet.
 We then train VTAMIQ on the large KADIS-700k [2] dataset, 
 which contains 700,000 image pairs along with the corresponding scores given by 
 11 conventional IQMs - this is our baseline model "weakly" pre-trained for IQA.
-
-The resulting model is then trained on the subjective perceptual preference data 
-from the PieAPP [3] dataset using the pairwise training framework proposed by the same authors.
 
 VTAMIQ is then fine-tuned on other IQA datasets and the performance is assessed.
 
@@ -108,9 +138,15 @@ run_custom.py examplifies how we customize training parameters and train our mod
 run_multi.py allows us to run multiple custom runs of training, record various train/validation/test metrics, 
 and assess the final performance of our model.
 
-## Pre-trained Model 
+## Pre-trained Model
 
-[January 27, 2022] Coming soon.
+[WIP]
+
+April 9, 2022: <a href="https://drive.google.com/file/d/1ucEKoSOIyMn1fYpqOAG-8DtedVFg_i3-">Pretrained on KADIS-700k*</a> 
+
+*We trained VTAMIQ on KADID10k, then used this trained model to predict quality scores for KADIS700k. These "improved"
+KADIS700k scores were then used for training VTAMIQ from scratch. 
+Note: the resulting model has 0.962 SROCC on KADID10k without being directly trained on it.
 
 ## References:
 
@@ -121,5 +157,5 @@ worth 16x16 words: Transformers for image recognition at scale, 2020.
 [2] Hanhe Lin, Vlad Hosu, and Dietmar Saupe. DeepFL-IQA: Weak supervision for deep iqa feature learning. arXiv
 preprint arXiv:2001.08113, 2020.
 
-[3] Ekta Prashnani, Hong Cai, Yasamin Mostofi, and Pradeep Sen.
-PieAPP: Perceptual image-error assessment through pairwise preference. CoRR, abs/1806.02067, 2018.
+[3] Junjie Ke, Qifei Wang, Yilin Wang, Peyman Milanfar, Feng Yang. MUSIQ: Multi-scale Image Quality Transformer. 
+arXiv:2108.05997, 2021.
