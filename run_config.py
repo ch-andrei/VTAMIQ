@@ -1,9 +1,12 @@
-from data.patch_datasets import patch_dataset_split
+from data.patch_datasets import dataset_split
 from collections import OrderedDict
 from copy import deepcopy
 import os, yaml
 
 import numpy as np
+
+from modules.Attention.ViT.transformer import VIT_VARIANT_B16, VIT_VARIANT_L16
+from modules.vtamiq.vtamiq import VTAMIQ
 
 # ************** CONSTANTS **************
 
@@ -32,7 +35,8 @@ SPLIT_TYPE_INDICES = "indices"
 PATCH_COUNT = "patch_count"
 BATCH_SIZE = "batch_size"
 SHUFFLE = "shuffle"
-PATCH_RFLIP = "allow_img_flip"
+PATCH_FLIP = "allow_img_flip"
+IMG_ZERO_ERORR_Q_PROB = "img_zero_error_q_prob"
 
 SROCC_FIELD = 'SROCC'
 KROCC_FIELD = 'KROCC'
@@ -42,10 +46,26 @@ RMSE_FIELD = 'RMSE'
 MODEL_SIQ = "SIQ"
 MODEL_SIQG = "SIQG"
 MODEL_SIQL = "SIQL"
+
 MODEL_VTAMIQ = "VTAMIQ"
 MODEL_VTAMIQp2b = "VTAMIQp2b"
+MODEL_VTAMIQp2bd = "VTAMIQp2bd"
+MODEL_VTAMIQp2bdqw = "VTAMIQp2bdwq"
+MODEL_VTAMIQr = "VTAMIQr"
+MODEL_VTAMIQrp2bqw = "VTAMIQrp2bwq"
+MODEL_VTAMIQm = "VTAMIQm"
+
 MODEL_LPIPS = "LPIPS"
 MODEL_PIEAPP = "PIEAPP"
+
+MODEL_STATE_DICT = "model_state_dict"
+Q_MAPPER_STATE_DICT = "q_mapper_state_dict"
+
+# ************** MODELS **************
+
+vtamiq_models = {
+    MODEL_VTAMIQ: VTAMIQ,
+}
 
 # ************** CONFIGS **************
 
@@ -58,7 +78,7 @@ global_config = OrderedDict(
     # dataloader_num_workers=8,
     # dataloader_num_workers=4,
     # dataloader_num_workers=1,
-    dataloader_num_workers=-1,  # -1 for default based on dataset, otherwise override to a particular count
+    dataloader_num_workers=-1,  # -1 to control this in script (based on dataset), otherwise to override
     dataloader_pin_memory=False,
     dataloader_persistent_workers=False,
 
@@ -68,11 +88,21 @@ global_config = OrderedDict(
     do_val=False,
     do_test=True,
 
+    train_save_latest=True,
+    test_use_latest=True,  # use latest or best SROCC model for testing
+    save_optimizer=False,
+
     model=MODEL_VTAMIQ,
 
-    dataset=DATASET_PIEAPP_TRAIN,
+    use_display_model=False,  # controls display simulation and PU encoding
+    use_q_mapper=False,  # additional module to remap Q
 
-    load_checkpoint_file=None,  # "./path/to/model.pth"
+    use_teacher_model=False,  # for pseudo meta labels
+    use_teacher_model_train=False,
+
+    dataset=DATASET_LIVE,
+
+    load_checkpoint_file=None,
 
     # === TRAINING PARAMS ===
 
@@ -82,17 +112,19 @@ global_config = OrderedDict(
 
     # === OPTIMIZER ===
     optimizer="AdamW",
-    optimizer_learning_rate=0.0001,
-    # optimizer_learning_rate=0.00005,
+    optimizer_learning_rate=0.00005,
+    # optimizer_learning_rate=0.0001,
     optimizer_learning_rate_decay_multistep=0.1,  # decay rate
     optimizer_learning_rate_decay_lambda=0.85,  # decay rate
     optimizer_weight_decay=0.01,  # 0.025
+
+    grad_scale=256,
 
     scheduler_type="multistep",  # ["multistep", "lambda"]
 
     optimizer_cosine_lr=False,
     optimizer_warmup_ratio=0.0,  # period of linear increase for lr scheduler
-    optimizer_decay_at_epochs=[14, 18],  # at which epochs to decay lr
+    optimizer_decay_at_epochs=[14, 18],
     optimizer_momentum=0.9,
 
     # loss function weights
@@ -115,12 +147,9 @@ global_config = OrderedDict(
     print_flops=False,
     print_params=True,
 
-    checkpoint_every_n_epoch=-1,  # -1 for no epoch-based checkpoints (will still checkpoint for best accuracy)
-    checkpoint_every_n_batches=5000,  # useful for datasets with very large epoch lengths (KADIS)
+    checkpoint_every_n_batches=3000,  # useful for datasets with very large size (KADIS)*
 
-    tensorlog_every_n_steps=10,  # for tensorboard writer
-
-    train_save_latest=False,  # always checkpoint regardless of accuracy
+    tensorlog_every_n_steps=10,  # fewer logs for tensorboard writer to limit the amount of logged data
 
     output_dir="./output",
     output_txt="output.txt",
@@ -130,19 +159,39 @@ global_config = OrderedDict(
     save_test_outputs_txt="test.txt"
 )
 
+display_model_config = OrderedDict(
+    rand_distrib_normal=False,
+    rand_distrib_ambient_mean=1500,  # randomize ambient around this mean
+    rand_distrib_ambient_delta=500,  # randomize ambient with this deviation (sigma if using normal distribution)
+    display_Lmax=1000,  # max luminance (cd/m2) of display
+    display_lmax_delta=500,
+)
+
+q_mapper_config = OrderedDict(
+    hidden=32,
+    sigmoid=True,
+    batch_norm=True,
+    non_lin_act=True,
+)
+
 # ************** CONFIGURATION FOR MODELS **************
 
 vtamiq_config = OrderedDict(
-    num_residual_groups=4,
-    num_rcabs_per_group=4,
-    dropout=0.2,
-
     use_diff_embedding=False,  # reference image aware difference modulation
 
-    vit_variant="B16",  # choose from ["B16", "L16"]
+    vit_variant=VIT_VARIANT_B16,  # choose from ["B16", "L16"] (VIT_VARIANT_B16, VIT_VARIANT_L16)
     vit_num_keep_layers=6,  # -1 for keeping all layers
     vit_use_scale_embedding=True,  # toggle to use scale embedding for ViT
+
+    num_transformer_diff_layers=2,
+    num_residual_groups=4,
+    num_rcabs_per_group=4,
+
+    dropout=0.1,
+
+    patch2batch=256  # patch count for encoding with ViT, if p2b strategy is used
 )
+
 vtamiq_runtime_config = OrderedDict(
     # there are two stages to pretraining VTAMIQ:
     # i) pretrain only ViT on ImageNet,
@@ -159,12 +208,18 @@ vtamiq_runtime_config = OrderedDict(
     # We don't want to overwrite pretrained BERT features while quality predictor is outputting garbage.
     # Instead, freeze the transformer, spend several epochs training quality predictor, then unfreeze the transformer
     # for combined fine-tuning.
-    vtamiq_allow_freeze=False,  # global toggle to allow freezing
-    diffnet_freeze=False,
-    freeze_encoder=True,  # ViT encoder
-    freeze_embeddings_patch=True,  # ViT patch embeddings
-    freeze_embeddings_pos=False,  # ViT positional embeddings
-    freeze_embeddings_scale=False,  # ViT scale embeddings
+    freeze_vtamiq=False,  # global toggle to allow freezing
+    freeze_conditional=False,  # allow freezing based on dataset and checkpoint parameters
+    freeze_dict=OrderedDict(
+        freeze_diffnet=False,
+        freeze_transformer_diff=False,
+        freeze_encoder=True,  # ViT encoder
+        freeze_embeddings_patch=True,  # ViT patch embeddings
+        freeze_embeddings_pos=True,  # ViT positional embeddings
+        freeze_embeddings_scale=False,  # ViT scale embeddings
+        freeze_q_predictor=False,
+        freeze_w_predictor=False,
+    ),
 
     # when to end freezing ViT weights (based on dataset)
     freeze_end_epoch={
@@ -184,12 +239,11 @@ vtamiq_runtime_config = OrderedDict(
         DATASET_KADIS700k: 1,
     }
 )
-
 # ************** DATASETS **************
 
-DATASET_TO_USE = lambda: global_config["dataset"]
+DATASET_USED = lambda: global_config["dataset"]
 
-# this will be passed to each dataset through object __init__
+# this will be passed to each dataset via __init__
 dataset_config_base = OrderedDict(
     full_reference=True,  # can set this to False to force NR IQA; only used for FR datasets
     return_full_resolution=False,  # toggle for returning the full resolution images in addition to the patches
@@ -197,15 +251,15 @@ dataset_config_base = OrderedDict(
     resolution="half",  # only relevant for KONIQ10k dataset, otherwise ignored
 
     patch_dim=16,
-    patch_num_scales=5,  # 16, 32, 64, 128, 256...
+    patch_num_scales=5,  # 5 scales -> 0: 16, 1: 32, 2: 64, 3: 128, 4: 256...
 
-    normalize=True,
-    normalize_imagenet=True,
+    normalize=True,  # apply normalization on preprocess
+    normalize_imagenet=False,  # normalize using imagenet's mean and std dev
 
     patch_sampler_config=OrderedDict(
-        centerbias_weight=2,
-        diffbased_weight=2,
-        uniform_weight=0.5,
+        centerbias_weight=0.25,
+        diffbased_weight=1,
+        uniform_weight=0.1,
     ),
 )
 
@@ -215,22 +269,25 @@ dataset_split_config_base = OrderedDict(
 
 dataloader_config = {
     SPLIT_NAME_TRAIN: {
-        BATCH_SIZE: 20,  # with 10GB VRAM and 256 patches/image: 20 for normal, 12 for pairwise IQA
+        BATCH_SIZE: 6,  # x256: [train/test] 20, 12 (pairwise); x512: 8, 5 (pairwise)
         SHUFFLE: True,
-        PATCH_COUNT: 256,
-        PATCH_RFLIP: True,
+        PATCH_COUNT: 512,
+        PATCH_FLIP: True,
+        IMG_ZERO_ERORR_Q_PROB: 0.01,
     },
     SPLIT_NAME_VAL: {
         BATCH_SIZE: 40,
         SHUFFLE: False,
         PATCH_COUNT: 1024,
-        PATCH_RFLIP: False,
+        PATCH_FLIP: False,
+        IMG_ZERO_ERORR_Q_PROB: -1,
     },
     SPLIT_NAME_TEST: {
         BATCH_SIZE: 40,
         SHUFFLE: False,
         PATCH_COUNT: 1024,
-        PATCH_RFLIP: False,
+        PATCH_FLIP: False,
+        IMG_ZERO_ERORR_Q_PROB: -1,
     },
 }
 
@@ -278,13 +335,13 @@ csiq_split_config = {
 
 pieapptrain_split_config = {
     SPLIT_TYPE_RANDOM: {
-        SPLIT_NAME_TRAIN: 120,
-        SPLIT_NAME_VAL: 20,
+        SPLIT_NAME_TRAIN: 130,
+        SPLIT_NAME_VAL: 10,
         SPLIT_NAME_TEST: 0,
     },
     SPLIT_TYPE_INDICES: {
-        SPLIT_NAME_TRAIN: [i for i in range(120)],
-        SPLIT_NAME_VAL: [i for i in range(120, 140)],
+        SPLIT_NAME_TRAIN: [i for i in range(130)],
+        SPLIT_NAME_VAL: [i for i in range(130, 140)],
         SPLIT_NAME_TEST: [i for i in range(140)],  # not used
     },
 }
@@ -501,8 +558,8 @@ class DatasetFactory(object):
         )
 
         for split_name in split_config:
-            dataset_split = patch_dataset_split(name=split_name, indices=split_config[split_name])
-            dataset.add_split(dataset_split)
+            split = dataset_split(name=split_name, indices=split_config[split_name])
+            dataset.add_split(split)
 
         return dataset
 
@@ -511,7 +568,7 @@ def get_dataloaders(dataset_factory: DatasetFactory = None):
     if dataset_factory is None:
         dataset_factory = DatasetFactory()
 
-    dataset = dataset_factory.get_dataset(DATASET_TO_USE())
+    dataset = dataset_factory.get_dataset(DATASET_USED())
 
     def get_dataloader(dataset, split_name):
         dataloader_params = dataloader_config[split_name]
@@ -522,7 +579,8 @@ def get_dataloaders(dataset_factory: DatasetFactory = None):
             split_name=split_name,
             batch_size=dataloader_params[BATCH_SIZE],
             patch_count=dataloader_params[PATCH_COUNT],
-            allow_img_flip=dataloader_params[PATCH_RFLIP],
+            allow_img_flip=dataloader_params[PATCH_FLIP],
+            img_zero_error_q_prob=dataloader_params[IMG_ZERO_ERORR_Q_PROB],
             shuffle=dataloader_params[SHUFFLE],
             num_workers=global_config["dataloader_num_workers"],
             pin_memory=global_config["dataloader_pin_memory"],
@@ -540,7 +598,7 @@ def get_dataloaders(dataset_factory: DatasetFactory = None):
 # ************** FUNCTIONS **************
 
 
-def store_config_files(output_dir):
+def save_configs(output_dir):
     def dump(config, name):
         path = os.path.join(output_dir, "{}.yaml".format(name))
         with open(path, "w") as f:
@@ -548,13 +606,17 @@ def store_config_files(output_dir):
 
     dump(global_config, "config")
 
-    if MODEL_VTAMIQ in global_config["model"]:
+    if global_config["model"] in vtamiq_models:
         dump(vtamiq_config, "vtamiq_config")
         dump(vtamiq_runtime_config, "vtamiq_runtime_config")
 
     dump(dataset_config_base, "dataset_config_base")
+    dump(dataloader_config, "dataloader_config")
 
-    is_used = lambda database_name: DATASET_TO_USE() == database_name
+    is_used = lambda database_name: DATASET_USED() == database_name
+
+    if global_config["use_q_mapper"]:
+        dump(q_mapper_config, "q_mapper_config")
 
     if is_used(DATASET_TID2013):
         dump(tid2013_split_config, "tid_dataset_config")
@@ -582,16 +644,16 @@ def store_config_files(output_dir):
 
 def validate_configs():
     assert not (
-            DATASET_TO_USE() == DATASET_KADIS700k and
+            DATASET_USED() == DATASET_KADIS700k and
             dataset_split_config_base["split_type"] == SPLIT_TYPE_RANDOM
     ), "split_type must be '{}' when using KADIS700k dataset.".format(SPLIT_TYPE_RANDOM)
 
-    if DATASET_TO_USE() == DATASET_KADIS700k:
-        vtamiq_runtime_config["allow_freeze_vit"] = False
-        print("Using", DATASET_KADIS700k, 'dataset. Freezing VTAMIQ ViT was disabled.')
+    # if DATASET_TO_USE() == DATASET_KADIS700k:
+    #     vtamiq_runtime_config["allow_freeze_vit"] = False
+    #     print("Using", DATASET_KADIS700k, 'dataset. Freezing VTAMIQ ViT was disabled.')
 
     if global_config["dataloader_num_workers"] == -1:
-        dataset = DATASET_TO_USE()
+        dataset = DATASET_USED()
         if dataset == DATASET_LIVE or dataset == DATASET_TID2008 or dataset == DATASET_CSIQ:
             global_config["dataloader_num_workers"] = 4
         elif dataset == DATASET_TID2013 or dataset == DATASET_PIEAPP_TEST:
@@ -610,3 +672,6 @@ def validate_configs():
 
         if dataset == DATASET_PIEAPP_TRAIN:
             print("WARNING: using Pairwise training mode.")
+
+
+# print("WARNING: call validate_configs() if externally modifying config dicts.")

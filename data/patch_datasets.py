@@ -2,13 +2,13 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler, RandomSampler, SequentialSampler
 
-from data.patch_sampling import PatchSampler
+from data.sampling.patch_sampling import PatchSampler
 from copy import deepcopy
 
 from collections import namedtuple
 
 
-patch_dataset_split = namedtuple("patch_dataset_split", ["name", "indices"])
+dataset_split = namedtuple("dataset_split", ["name", "indices"])
 
 
 class PatchDataset(Dataset):
@@ -58,6 +58,8 @@ class PatchDataset(Dataset):
         self.patch_count = patch_count
         self.patch_num_scales = max(1, patch_num_scales)
 
+        print("Dataset using {} scales".format(patch_num_scales))
+
         if patch_sampler_config is None:
             patch_sampler_config = {}
         self.patch_sampler = PatchSampler(**patch_sampler_config)
@@ -69,10 +71,9 @@ class PatchDataset(Dataset):
         self.imagenet_norm_mean = [0.485, 0.456, 0.406]
         self.imagenet_norm_std = [0.229, 0.224, 0.225]
 
-        # default normalizing parameters: ImageNet mean and std deviation values
-        # note: each dataset can override this to something else, which would be used if self.normalize_imagenet is False
-        self.norm_mean = deepcopy(self.imagenet_norm_mean)
-        self.norm_std = deepcopy(self.imagenet_norm_std)
+        # default normalization parameters if not imagenet
+        self.norm_mean = [0.5, 0.5, 0.5]
+        self.norm_std = [0.5, 0.5, 0.5]
 
         # read dataset files and collect paths
         self.data = self.read_dataset()
@@ -87,7 +88,7 @@ class PatchDataset(Dataset):
     def comparisons_per_image(self, i):
         return self.num_dist_images
 
-    def add_split(self, split: patch_dataset_split = None):
+    def add_split(self, split: dataset_split = None):
         """
         computes dataset entry indices for each split
         :param split: named tuple containing name and indices for new split
@@ -97,7 +98,7 @@ class PatchDataset(Dataset):
 
         if split is None:
             # default to simply all images in the dataset
-            split = patch_dataset_split(
+            split = dataset_split(
                 name=self.DEFAULT_SPLIT_NAME,
                 indices=[i for i in range(self.num_ref_images)],
             )
@@ -118,7 +119,7 @@ class PatchDataset(Dataset):
             print("Warning: {} dataset overwriting an existing split with name '{}'.".format(
                 self.name, split.name))
 
-        split = patch_dataset_split(split.name, indices)
+        split = dataset_split(split.name, indices)
 
         self.splits_dict[split.name] = split
 
@@ -140,20 +141,18 @@ class PatchDataset(Dataset):
         return [0., 0., 0.], [1., 1., 1.]  # parameters for no normalization
 
     @staticmethod
-    def crop_params_pos(i, j, hw):
-        xy = np.array([i, j], np.float32) / hw  # rescale to [0, 1]
-        xy = xy * 2 - 1  # rescale to [-1, 1]
-        return torch.as_tensor(xy, dtype=torch.float32)
+    def crop_params_tensor(i, j, max_h, max_w):
+        return torch.as_tensor([i / max_h, j / max_w], dtype=torch.float32) * 2. - 1.  # rescale to [-1, 1]
 
     @staticmethod
-    def get_height_width_factor(img, patch_dim):
+    def get_max_height_width(height, width, patch_height, patch_width):
         # constant for normalizing crop parameters (for uv)
-        return np.array([img.height - patch_dim[0], img.width - patch_dim[1]])
+        return height - patch_height, width - patch_width
 
     @staticmethod
-    def get_height_width_factor_hw(height, width, patch_dim):
+    def get_height_width_factor_hw(height, width, patch_height, patch_width):
         # constant for normalizing crop parameters (for uv)
-        return np.array([height - patch_dim[0], width - patch_dim[1]])
+        return np.array([height - patch_height, width - patch_width])
 
     def read_dataset(self):
         raise NotImplementedError("CustomDataset {} read_dataset() not implemented.".format(self.name))
@@ -166,13 +165,15 @@ class PatchDataset(Dataset):
 
 
 class PatchDatasetSampler(Sampler):
-    def __init__(self, data_source: PatchDataset, split_name, patch_count, allow_img_flip, shuffle):
+    def __init__(self, data_source: PatchDataset, shuffle,
+                 split_name, patch_count, allow_img_flip, img_zero_error_q_prob):
         self.split_name = split_name
         self.patch_count = patch_count
         self.allow_img_flip = allow_img_flip
-
+        self.img_zero_error_q_prob = img_zero_error_q_prob
         self.patch_dataset = data_source
-        self.patch_dataset.set_split(split_name)
+
+        self.update_patch_dataset()
 
         if shuffle:
             self.sampler = RandomSampler(data_source)
@@ -183,18 +184,23 @@ class PatchDatasetSampler(Sampler):
         return iter(self.sampler)
 
     def __len__(self):
-        # this runs when dataset loader __iter__ is called thereby modifying patch_dataset as needed by current split
+        # this runs when dataset loader __iter__ is called and modifies patch_dataset as needed by current split
+        self.update_patch_dataset()
+        return len(self.patch_dataset)
+
+    def update_patch_dataset(self):
         self.patch_dataset.set_split(self.split_name)  # set the correct split
         self.patch_dataset.patch_count = self.patch_count
         self.patch_dataset.allow_img_flip = self.allow_img_flip
-        return len(self.patch_dataset)
+        self.patch_dataset.img_zero_error_q_prob = self.img_zero_error_q_prob
 
 
 class PatchDatasetLoader(DataLoader):
-    def __init__(self, dataset, split_name, shuffle, patch_count, allow_img_flip, **kwargs):
+    def __init__(self, dataset, split_name, shuffle, patch_count, allow_img_flip=False, img_zero_error_q_prob=-1,
+                 **kwargs):
         assert isinstance(dataset, PatchDataset), "PatchDatasetLoader must be paired with a PatchDataset."
         assert dataset.has_split(split_name), "PatchDatasetLoader must be paired with a PatchDataset with a split"
-        sampler = PatchDatasetSampler(dataset, split_name, patch_count, allow_img_flip, shuffle)
+        sampler = PatchDatasetSampler(dataset, shuffle, split_name, patch_count, allow_img_flip, img_zero_error_q_prob)
         super(PatchDatasetLoader, self).__init__(dataset, sampler=sampler, **kwargs)
 
     def __iter__(self):

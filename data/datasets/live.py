@@ -38,8 +38,8 @@ class LIVEDataset(FRIqaPatchDataset):
             **kwargs
         )
 
-        self.norm_mean = [0.4803, 0.4598, 0.4018]
-        self.norm_std = [0.2196, 0.2202, 0.2221]
+        # self.norm_mean = [0.4803, 0.4598, 0.4018]
+        # self.norm_std = [0.2196, 0.2202, 0.2221]
 
         self.img_dim = None
 
@@ -102,6 +102,12 @@ class LIVEDataset(FRIqaPatchDataset):
             images[i] = (img_name_ref, len(comparisons))
 
         self.images = images
+
+        # from pprint import pprint
+        # pprint(self.images)
+        #
+        # for path_ref, path_dist in zip(paths_ref, paths_dist):
+        #     print(path_ref, path_dist)
 
         qs = np.array(qs)
 

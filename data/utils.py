@@ -4,7 +4,8 @@ import torchvision.transforms.functional as functional
 
 def transform(img,
               crop_params=None,
-              r_flip=None,
+              h_flip=False,
+              v_flip=False,
               norm_params=None,
               grayscale=False,
               ):
@@ -13,12 +14,14 @@ def transform(img,
     :param img: PIL image
     :param crop_params:
         i, j, h, w: top left corner coord [i, j] and [height, width] to extract
-    :param r_flip:
-        bool, toggle for horizontal flip
+    :param h_flip, v_flip:
+        bool, toggle for horizontal/vertical flip
     :param norm_params:
         None or tuple [norm_std, norm_mean] norm_std and norm_mean should have 3 channels each
     :param grayscale:
         Convert to grayscale and stack in 3 channels
+    :param display_model:
+        display model simulation and PU-encoding
     :return:
     """
 
@@ -27,9 +30,11 @@ def transform(img,
         i, j, h, w = crop_params
         img = functional.crop(img, i, j, h, w)
 
-    # random flip
-    if r_flip:
+    # random flips
+    if h_flip:
         img = functional.hflip(img)
+    if v_flip:
+        img = functional.vflip(img)
 
     if grayscale:
         img = functional.rgb_to_grayscale(img, num_output_channels=3)
@@ -48,7 +53,8 @@ def transform(img,
 def get_transform_params(img1, img2,
                          patch_sampler,
                          patch_dim=None,
-                         r_flip=None
+                         h_flip=None,
+                         v_flip=None,
                          ):
     """
     :param img1:
@@ -64,10 +70,15 @@ def get_transform_params(img1, img2,
     else:
         crop_params = patch_sampler.get_sample_params(img1, img2, patch_dim[0], patch_dim[1])
 
-    if r_flip is None:
-        r_flip = torch.rand(1) <= 0.5
+    rsamples = torch.rand(2)
 
-    return crop_params, r_flip
+    if h_flip is None:
+        h_flip = rsamples[0] <= 0.5
+
+    if v_flip is None:
+        v_flip = rsamples[1] <= 0.5
+
+    return crop_params, h_flip, v_flip
 
 
 def transform_img(img,
@@ -75,8 +86,8 @@ def transform_img(img,
                   patch_dim=None,
                   norm_params=None
                   ):
-    crop_params, r_flip = get_transform_params(img, img, patch_sampler, patch_dim)
-    tensor = transform(img, crop_params, r_flip, norm_params)
+    crop_params, h_flip, v_flip = get_transform_params(img, img, patch_sampler, patch_dim)
+    tensor = transform(img, crop_params, h_flip, norm_params)
     return tensor
 
 
@@ -85,7 +96,7 @@ def transform_img_pair(img1, img2,
                        patch_dim=None,
                        norm_params=None
                        ):
-    crop_params, r_flip = get_transform_params(img1, img2, patch_sampler, patch_dim)
-    tensor1 = transform(img1, crop_params, r_flip, norm_params)
-    tensor2 = transform(img2, crop_params, r_flip, norm_params)
+    crop_params, h_flip, v_flip = get_transform_params(img1, img2, patch_sampler, patch_dim)
+    tensor1 = transform(img1, crop_params, h_flip, v_flip, norm_params)
+    tensor2 = transform(img2, crop_params, h_flip, v_flip, norm_params)
     return tensor1, tensor2

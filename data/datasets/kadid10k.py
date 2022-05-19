@@ -15,11 +15,6 @@ class KADID10kDataset(TID2013Dataset):
             **kwargs
         )
 
-        # TODO: recompute mean/std for KADID10k
-        # currently using TID2013 mean/std values
-        self.norm_mean = [0.4372, 0.4634, 0.4204]
-        self.norm_std = [0.2421, 0.2150, 0.2291]
-
     def read_dataset(self):
         return super().read_dataset(
             reference_images_path='/images',

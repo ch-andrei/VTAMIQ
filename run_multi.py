@@ -44,7 +44,7 @@ def main():
     global_config["scheduler_type"] = "multistep"
     global_config["optimizer_learning_rate_decay_multistep"] = 0.1
 
-    output_dir = "./output/{}-multirun-{}".format(int(time.time()), DATASET_TO_USE())
+    output_dir = "./output/{}-multirun-{}".format(int(time.time()), DATASET_USED())
     output_file = "results.txt"
 
     os.makedirs(output_dir, exist_ok=True)

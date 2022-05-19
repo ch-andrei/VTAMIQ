@@ -32,8 +32,8 @@ class KONIQ10k(NRIqaPatchDataset):
             **kwargs
         )
 
-        self.norm_mean = [0.4618, 0.4178, 0.3700]
-        self.norm_std = [0.2298, 0.2159, 0.2132]
+        # self.norm_mean = [0.4618, 0.4178, 0.3700]
+        # self.norm_std = [0.2298, 0.2159, 0.2132]
 
     def read_dataset(self):
         """

@@ -24,14 +24,14 @@ class TID2013Dataset(FRIqaPatchDataset):
             **kwargs
         )
 
-        # TID2013 statistics computed using 3000 test images + 25 reference images
-        self.norm_mean = [0.4735, 0.4304, 0.3593]
-        self.norm_std = [0.2008, 0.2029, 0.1905]
+        # # TID2013 statistics computed using 3000 test images + 25 reference images
+        # self.norm_mean = [0.4735, 0.4304, 0.3593]
+        # self.norm_std = [0.2008, 0.2029, 0.1905]
 
         self.img_dim = (384, 512)
 
     def read_dataset(self,
-                     # to support TID2008 and TID2013, the following vars were added
+                     # to support reading datasets similar to TID, the following vars were added
                      reference_images_path="/reference_images",
                      distorted_images_path="/distorted_images",
                      q_file_name="mos_with_names.txt",

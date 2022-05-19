@@ -11,11 +11,13 @@ from tqdm import tqdm
 from tensorboardX import SummaryWriter
 import tabulate
 
+import torch
+import torch.nn as nn
 import torch.nn.functional as functional
 
 
 from utils.accumulators import Mean, Max
-from utils.correlations import compute_correlations
+from utils.correlations import compute_correlations as _compute_correlations
 from utils.logging import FileLogger
 
 from modules.vtamiq.vtamiq import VTAMIQ
@@ -63,12 +65,21 @@ class SplitSummaryWriter(SummaryWriter):
             accumul.reset()
 
 
-def get_optimizer(parameters):
+def get_optimizer(models):
     """
     Create an optimizer for a given model
     :param model_parameters: a list of parameters to be trained
     :return: Tuple (optimizer, scheduler)
     """
+
+    parameters = []
+    for model in models:
+        if model is not None:
+            for parameter in model.parameters():
+                parameters.append(parameter)
+
+    assert 0 < len(parameters), "Optimizer must have parameters to optimize."  # check that not everything is frozen
+
     if global_config["optimizer"] == "SGD":
         optimizer = torch.optim.SGD(
             parameters,
@@ -107,16 +118,16 @@ def get_optimizer(parameters):
     return optimizer, scheduler
 
 
-def get_model_state_dict(filename, device):
+def get_checkpoint(filename, device):
     if filename is None:
         return None
 
     """Load model from a checkpoint"""
-    print("Loading model parameters from '{}'".format(filename))
+    print("Loading model parameters '{}'".format(filename))
     with open(filename, "rb") as f:
-        checkpoint_data = torch.load(f, map_location=device)
+        checkpoint = torch.load(f, map_location=device)
 
-    return checkpoint_data["model_state_dict"]
+    return checkpoint
 
 
 def get_model(device, is_full_reference, checkpoint_file=None):
@@ -127,20 +138,22 @@ def get_model(device, is_full_reference, checkpoint_file=None):
 
     pretrained_model = checkpoint_file is not None
     model = global_config["model"]
-    model_state_dict = get_model_state_dict(checkpoint_file, device) if pretrained_model else None
 
-    if model == MODEL_VTAMIQ or model == MODEL_VTAMIQp2b:
+    if model in vtamiq_models:
         print("Using Model: {}.".format(model))
 
         # no need to load pretrained ViT transformer if already loading a pretrained VTAMIQ
         vit_load_pretrained = vtamiq_runtime_config["allow_pretrained_weights"]
 
-        model = VTAMIQ(
-            get_vit_config(vtamiq_config["vit_variant"]),
+        # get model type
+        model = vtamiq_models[model]
+
+        # intialize model
+        model = model(
             **vtamiq_config,
             vit_load_pretrained=vit_load_pretrained,
-            is_full_reference=is_full_reference
-            )
+            is_full_reference=is_full_reference,
+        )
 
         if pretrained_model:
             def pop_layers_fromn_model_state_dict(layer_prefix):
@@ -160,17 +173,34 @@ def get_model(device, is_full_reference, checkpoint_file=None):
         raise TypeError("[{}] model is unsupported.".format(model))
 
     if pretrained_model:
-        load_model(model_state_dict, model)
+        print("Model loading pretrained weights...")
+        model_state_dict = get_checkpoint(checkpoint_file, device)[MODEL_STATE_DICT]
+        load_model(model_state_dict, model, "model")
+    else:
+        print("WARNING: VTAMIQ used without pre-trained model weights.")
 
     model.to(device, dtype=torch.float32)
     if device == torch.device("cuda"):
-        # from torch.nn.parallel import DistributedDataParallel as DDP
         print("Model {} using GPU".format(global_config["model"]))
-        # model = DDP(model)
-        # model = torch.nn.DataParallel(model)
-        torch.backends.cudnn.benchmark = True
 
     return model
+
+
+def get_q_mapper(device, checkpoint_file=None):
+    from modules.vtamiq.vtamiq import QMapper
+
+    q_mapper = QMapper(**q_mapper_config)
+
+    if checkpoint_file is not None:
+        try:
+            q_mapper_state_dict = get_checkpoint(checkpoint_file, device)[Q_MAPPER_STATE_DICT]
+            load_model(q_mapper_state_dict, q_mapper, "q_mapper")
+        except (KeyError, AttributeError):
+            print("q_mapper parameters missing... will not load weights.")
+
+    q_mapper.to(device, dtype=torch.float32)
+
+    return q_mapper
 
 
 def print_parameters(model):
@@ -198,7 +228,7 @@ def print_flops(model):
     print("Number of FLOPS:", human_format(num_flops))
 
 
-def store_checkpoint(output_dir, filename, model, epoch, test_accuracy):
+def save_checkpoint(output_dir, filename, model, q_mapper, optimizer, scaler, epoch, test_accuracy):
     """Store a checkpoint file to the output directory"""
     path = os.path.join(output_dir, filename)
 
@@ -207,19 +237,25 @@ def store_checkpoint(output_dir, filename, model, epoch, test_accuracy):
     if not os.path.isdir(directory):
         os.makedirs(directory, exist_ok=True)
 
+    model_state_dict = {
+        "epoch": epoch,
+        "test_accuracy": test_accuracy,
+        MODEL_STATE_DICT: OrderedDict([
+            (key, value) for key, value in model.state_dict().items()
+        ]),
+        Q_MAPPER_STATE_DICT: None if q_mapper is None else OrderedDict([
+            (key, value) for key, value in q_mapper.state_dict().items()
+        ])
+    }
+
+    if global_config["save_optimizer"]:
+        model_state_dict["optimizer"] = optimizer
+        model_state_dict["scaler"] = scaler
+
     time.sleep(
         1
     )  # workaround for RuntimeError('Unknown Error -1') https://github.com/pytorch/pytorch/issues/10577
-    torch.save(
-        {
-            "epoch": epoch,
-            "test_accuracy": test_accuracy,
-            "model_state_dict": OrderedDict([
-                (key, value) for key, value in model.state_dict().items()
-            ]),
-        },
-        path,
-    )
+    torch.save(model_state_dict, path)
 
 
 def store_model_params(model, output_dir):
@@ -237,37 +273,49 @@ def get_data_tuple(batch, device):
     convert = lambda x: x.to(device, dtype=torch.float32)
     out_data = tuple()  # q values
     for data in batch:  # patches
-        out_data += (convert(data), )
+        data = convert(data)
+        out_data += (data, )
     return out_data
 
 
-def model_predict(model, data, device, is_full_reference_iqa, is_pairwise, need_pos_input):
-    data = get_data_tuple(data, device)
-
-    if is_pairwise:
+def model_predict(model, data,
+                  is_full_reference_iqa, is_pieapp_pref, need_pos_scale, q_mapper):
+    if is_pieapp_pref:
         q, patches_ref, patches_dist1, patches_dist2, patches_pos, patches_scales = data[:6]
 
-        if need_pos_input:
+        if need_pos_scale:
             q1 = model((patches_ref, patches_dist1), patches_pos, patches_scales)
             q2 = model((patches_ref, patches_dist2), patches_pos, patches_scales)
         else:
             q1 = model((patches_ref, patches_dist1))
             q2 = model((patches_ref, patches_dist2))
 
-        q_p = 1. / (1. + torch.exp(q1 - q2))
+        if q_mapper is not None:
+            delta_q = (q1 - q2).view(-1, 1)
+            q_p = q_mapper(delta_q)
+        else:
+            q_p = 1. / (1. + torch.exp(q1 - q2))  # preference equation
 
     else:
         if is_full_reference_iqa:
             q, patches_ref, patches_dist, patches_pos, patches_scales = data[:5]
+
             patches = (patches_ref, patches_dist)
         else:
             q, patches_dist, patches_pos, patches_scales = data[:4]
-            patches = (patches_dist,)
 
-        if need_pos_input:
+            patches = (patches_dist, )
+
+        if need_pos_scale:
             q_p = model(patches, patches_pos, patches_scales)
         else:
             q_p = model(patches)
+
+        if q_mapper is not None:
+            q_p = q_p.view(-1, 1)
+            q_p = q_mapper(q_p)
+
+    q_p = q_p.flatten()
 
     return q, q_p
 
@@ -278,14 +326,14 @@ def main():
 
     is_debug = global_config["is_debug"]
     is_verbose = global_config["is_verbose"]
-    is_pairwise = global_config["dataset"] == DATASET_PIEAPP_TRAIN
-
-    is_vtamiq = global_config["model"] == MODEL_VTAMIQ or global_config["model"] == MODEL_VTAMIQp2b
+    is_pieapp_pref = DATASET_USED() == DATASET_PIEAPP_TRAIN
+    is_vtamiq = global_config["model"] == MODEL_VTAMIQ
     is_lpips = global_config["model"] == MODEL_LPIPS
+    is_q_mapper = global_config["use_q_mapper"]
+    is_test_only = not global_config["do_train"] and not global_config["do_val"] and global_config["do_test"]
+    is_full_reference_iqa = not DATASET_USED() == "KONIQ10k" and dataset_config_base["full_reference"]
 
-    is_full_reference_iqa = not DATASET_TO_USE() == "KONIQ10k" and dataset_config_base["full_reference"]
-
-    need_pos_input = is_vtamiq  # need to be passed pos info on forward() call
+    need_pos_scale = is_vtamiq  # need to be passed pos info on forward() call
 
     checkpoint_file = global_config["load_checkpoint_file"]
 
@@ -293,12 +341,14 @@ def main():
     device = torch.device("cuda" if not global_config["no_cuda"] and torch.cuda.is_available() else "cpu")
     model = get_model(device, is_full_reference_iqa, checkpoint_file)
 
+    q_mapper = None
+    if is_q_mapper:
+        q_mapper = get_q_mapper(device, checkpoint_file)
+
     output_dir = global_config["output_dir"]
     output_dir += "/{}".format(int(time.time()))
 
-    output_dir += "-" + DATASET_TO_USE()
-    output_dir += "-p{}".format(dataset_config_base["patch_dim"])
-
+    output_dir += "-" + DATASET_USED()
     output_dir += "-" + global_config["model"]
 
     if is_vtamiq:
@@ -308,10 +358,14 @@ def main():
             vtamiq_config["num_rcabs_per_group"]
         )
 
-    output_dir += "-{}e-{}b-{}p".format(
-        global_config["num_epochs"],
-        dataloader_config[SPLIT_NAME_TRAIN][BATCH_SIZE],
-        dataloader_config[SPLIT_NAME_TRAIN][PATCH_COUNT])
+    if is_test_only:
+        output_dir += "-TESTSET-" + str(dataloader_config[SPLIT_NAME_TEST][PATCH_COUNT])
+    else:
+        output_dir += "-{}e-{}b-{}p".format(
+            global_config["num_epochs"],
+            dataloader_config[SPLIT_NAME_TRAIN][BATCH_SIZE],
+            dataloader_config[SPLIT_NAME_TRAIN][PATCH_COUNT]
+        )
 
     if not global_config["do_train"] and not global_config["do_val"] and global_config["do_test"]:
         output_dir += "-TESTSET"
@@ -325,22 +379,26 @@ def main():
         # freeze transformer if
         # 1. not loading a pretrained VTAMIQ
         # 2. fine-tuning on a dataset with a VTAMIQ model pretrained on another dataset
-        need_freeze_transformer = \
-            vtamiq_runtime_config["vtamiq_allow_freeze"] and \
-            (checkpoint_file is None or DATASET_TO_USE() not in checkpoint_file)
+        need_freeze_transformer = not is_test_only and (
+                vtamiq_runtime_config["freeze_vtamiq"] or
+                (vtamiq_runtime_config["freeze_conditional"] and
+                (checkpoint_file is None or DATASET_USED() not in checkpoint_file))
+        )
 
-        # need_freeze_transformer = False  # OVERRIDE
+        # keep transformer weights frozen until an appropriate number of epochs are completed
+        freeze_end_epoch = vtamiq_runtime_config["freeze_end_epoch"][DATASET_USED()]
 
-        # keep transformer weights frozen until this many epochs are completed
-        freeze_end_epoch = vtamiq_runtime_config["freeze_end_epoch"][DATASET_TO_USE()]
-        # 2 epochs for KADID
-        # 5 epochs for TID and LIVE
+        if need_freeze_transformer:
+            output_dir += "-freeze"
+
+    # store final output_dir
+    global_config["output_dir"] = output_dir
 
     if not is_debug:
         os.makedirs(output_dir, exist_ok=True)
 
         # save config in YAML file
-        store_config_files(output_dir)
+        save_configs(output_dir)
 
         store_model_params(model, output_dir)
 
@@ -355,8 +413,8 @@ def main():
     logger_path = None if is_debug else ("{}/{}".format(output_dir, global_config["output_txt"]))
     logger = FileLogger(logger_path, verbose=is_verbose)
 
-    logger_debug_path = None if is_debug else ("{}/{}".format(output_dir, global_config["debug_txt"]))
-    logger_debug = FileLogger(logger_debug_path, verbose=is_verbose)
+    # logger_debug_path = ("{}/{}".format(output_dir, global_config["debug_txt"])) if not is_debug else None
+    # logger_debug = FileLogger(logger_debug_path, verbose=is_verbose and is_debug)
 
     logger(f"tensorboard --logdir='{output_dir}'")
 
@@ -371,15 +429,13 @@ def main():
 
     train_loader, val_loader, test_loader, dataset = get_dataloaders(dataset_factory=None)
 
-    logger("splits_dict:", dataset.splits_dict_ref)
+    logger("splits_dict Train:", dataset.splits_dict_ref[SPLIT_NAME_TRAIN])
+    logger("splits_dict Val:", dataset.splits_dict_ref[SPLIT_NAME_VAL])
+    logger("splits_dict Test:", dataset.splits_dict_ref[SPLIT_NAME_TEST])
 
     max_steps = global_config["num_epochs"]
     if global_config["optimizer_cosine_lr"]:
         max_steps *= len(train_loader.dataset) // global_config["batch_size_train"] + 1
-
-    checkpoint_every_n_epoch = global_config["checkpoint_every_n_epoch"]
-    if checkpoint_every_n_epoch <= 0:
-        checkpoint_every_n_epoch = 999999999999
 
     checkpoint_every_n_batches = global_config["checkpoint_every_n_batches"]
     if checkpoint_every_n_batches <= 0:
@@ -391,18 +447,12 @@ def main():
     if global_config["print_params"]:
         print_parameters(model)
 
-    optimizer, scheduler = get_optimizer(model.parameters())
+    optimizer, scheduler = get_optimizer([model, q_mapper])
 
     if is_vtamiq and need_freeze_transformer:
         # freeze VTAMIQ transformer
-        model.set_freeze_state(True,
-                               diffnet=vtamiq_runtime_config["diffnet_freeze"],
-                               encoder=vtamiq_runtime_config["freeze_encoder"],
-                               embed_patch=vtamiq_runtime_config["freeze_embeddings_patch"],
-                               embed_pos=vtamiq_runtime_config["freeze_embeddings_pos"],
-                               embed_scale=vtamiq_runtime_config["freeze_embeddings_scale"],
-                               )
-        logger("VTAMIQ: Froze parameters...")
+        logger("VTAMIQ: Freezing params...")
+        model.set_freeze_state(freeze_state=True, freeze_dict=vtamiq_runtime_config["freeze_dict"])
 
     global_step_train = 0
     global_step_val = 0
@@ -480,12 +530,15 @@ def main():
 
     def tensor_list_flat_cat(tensor_list):
         # concatenate and flatten all tensors into one long vector
-        return torch.cat(tensor_list, dim=0).flatten()
+        t1 = tensor_list[0]
+        for t2 in tensor_list[1:]:
+            t1 = torch.cat((t1, t2), dim=0)
+        return t1.flatten()
 
-    def compute_scores(ys, yp):
+    def compute_correlations(ys, yp):
         ys = np.array(tensor_list_flat_cat(ys), dtype=np.float).flatten()
         yp = np.array(tensor_list_flat_cat(yp), dtype=np.float).flatten()
-        spearman, kendall, pearson, rmse = compute_correlations(ys, yp)
+        spearman, kendall, pearson, rmse = _compute_correlations(ys, yp)
         return spearman, kendall, pearson, rmse
 
     def writer_log_losses(split_name, loss, loss_mae, loss_rank, loss_pears, step):
@@ -498,8 +551,10 @@ def main():
         writer.add_scalar(split_name, "mae_loss", loss, step)
 
     def do_training(scaler, split_name, loader, step):
-        # Enable training mode (automatic differentiation + batch norm)
+        # Enable training mode (automatic differentiation, dropout, batch norm)
         model.train()
+        if q_mapper is not None:
+            q_mapper.train()
 
         ys = []
         yp = []
@@ -509,10 +564,16 @@ def main():
             optimizer.zero_grad()
 
             with torch.cuda.amp.autocast():
-                q, q_p = model_predict(model, data, device, is_full_reference_iqa, is_pairwise, need_pos_input)
+                data = get_data_tuple(data, device)
+
+                q, q_p = model_predict(
+                    model, data, is_full_reference_iqa, is_pieapp_pref, need_pos_scale, q_mapper
+                )
+
                 batch_size = q.shape[0]
 
-                if is_pairwise:
+                if is_pieapp_pref:
+                    # only optimize MAE when training with pairwise preference data
                     loss = mse_loss(q_p, q)
                 else:
                     loss, loss_mae, loss_rank, loss_pears = loss_func(q_p, q, batch_size)
@@ -530,7 +591,7 @@ def main():
             yp.append(q_p.detach().cpu())
 
             if not is_debug:
-                if is_pairwise:
+                if is_pieapp_pref:
                     writer_log_losses_pairwise(split_name, loss, step)
                 else:
                     writer_log_losses(split_name, loss, loss_mae, loss_rank, loss_pears, step)
@@ -538,27 +599,37 @@ def main():
             step += 1
 
             if not is_debug and (batch_i + 1) % checkpoint_every_n_batches == 0:  # +1 to skip early save
-                logger("Saving batch checkpoint: epoch=[{}], split=[{}], batch_i=[{}]".format(
+                logger("Saving latest model during training: epoch=[{}], split=[{}], batch_i=[{}]".format(
                     epoch, split_name, batch_i)
                 )
-                store_checkpoint(output_dir, "{:04d}-{:04d}.pth".format(epoch, batch_i), model, epoch, -1)
+                save_checkpoint(
+                    output_dir, "latest.pth".format(epoch, batch_i), model, q_mapper, scaler, optimizer, epoch, -1)
 
         # compute statistics over validation results
-        return step, compute_scores(ys, yp)
+        return step, compute_correlations(ys, yp)
 
     def do_validation(scaler, split_name, loader, step, log_writer=True, save_test_outputs=False):
-        if global_config["save_test_outputs"]:
-            test_logger = FileLogger(output_dir + "/" + global_config["save_test_outputs_txt"])
+        save_outputs = save_test_outputs and global_config["save_test_outputs"] and not global_config['is_debug']
+        if save_outputs:
+            test_logger = FileLogger(output_dir + "/" + global_config["save_test_outputs_txt"], verbose=False)
         y = []
         yp = []
         with torch.no_grad():
             model.eval()
+            if q_mapper is not None:
+                q_mapper.eval()
+
             # loop over validation data
             for i, data in enumerate(tqdm(loader)):
-                with torch.cuda.amp.autocast():
-                    q, q_p = model_predict(model, data, device, is_full_reference_iqa, is_pairwise, need_pos_input)
 
-                    if is_pairwise:
+                with torch.cuda.amp.autocast():
+                    data = get_data_tuple(data, device)
+
+                    q, q_p = model_predict(
+                        model, data, is_full_reference_iqa, is_pieapp_pref, need_pos_scale, q_mapper
+                    )
+
+                    if is_pieapp_pref:
                         loss = mae_loss(q_p, q)
                     else:
                         batch_size = q.shape[0]
@@ -567,15 +638,13 @@ def main():
                 y.append(q.cpu())
                 yp.append(q_p.cpu())
 
-                logger_debug('q_p:', np.array(q_p.cpu()), "y:", np.array(q.cpu()))
-
                 if log_writer and not is_debug:
-                    if is_pairwise:
+                    if is_pieapp_pref:
                         writer_log_losses_pairwise(split_name, loss, step)
                     else:
                         writer_log_losses(split_name, loss, loss_mae, loss_rank, loss_pears, step)
 
-                if save_test_outputs and global_config["save_test_outputs"]:
+                if save_outputs:
                     values = list(np.array(q_p.cpu()))
                     values_s = []
                     for value in values:
@@ -585,7 +654,7 @@ def main():
                 step += 1
 
         if 0 < len(y):
-            cor = compute_scores(y, yp)
+            cor = compute_correlations(y, yp)
         else:
             cor = 0., 0., 0., 0.
 
@@ -627,7 +696,7 @@ def main():
             RMSE_FIELD: rmse,
         }
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler(init_scale=global_config['grad_scale'])
 
     best_spearman_train = Max()
     best_spearman_val = Max()
@@ -640,10 +709,10 @@ def main():
         logger("Beginning epoch {:03d}".format(epoch))
 
         # check if need unfreeze VTAMIQ
-        if is_vtamiq and vtamiq_runtime_config["vtamiq_allow_freeze"] and epoch > freeze_end_epoch:
-            logger("VTAMIQ: Unfreezing transformer layers.")
-            model.set_freeze_state(False)
-            vtamiq_runtime_config["vtamiq_allow_freeze"] = False  # remove this flag to prevent calling this clause again
+        if not is_test_only and is_vtamiq and vtamiq_runtime_config["freeze_vtamiq"] and epoch > freeze_end_epoch:
+            logger("VTAMIQ: Unfreezing params...")
+            model.set_freeze_state(freeze_state=False, freeze_dict=vtamiq_runtime_config["freeze_dict"])
+            vtamiq_runtime_config["freeze_vtamiq"] = False  # remove this flag to prevent calling this clause again
 
         # default parameters
         split_name = "missing"
@@ -673,25 +742,32 @@ def main():
 
         if global_config["do_train"] and not is_debug:
             # Store checkpoints for the best model so far
-            if global_config["train_save_latest"] or is_best_so_far:
+            if global_config["train_save_latest"]:
+                logger("Saving latest model in validation: epoch=[{}], split=[{}], SROCC=[{}]".format(
+                    epoch, split_name, spearman)
+                )
+                save_checkpoint(output_dir, "latest.pth", model, q_mapper, scaler, optimizer, epoch, spearman)
+
+            if is_best_so_far:
                 logger("Saving best model: epoch=[{}], split=[{}], SROCC=[{}]".format(
                     epoch, split_name, spearman)
                 )
-                store_checkpoint(output_dir, "best.pth", model, epoch, spearman)
-
-            if epoch % checkpoint_every_n_epoch == 0:
-                logger("Saving checkpoint: epoch=[{}], split=[{}], SROCC=[{}]".format(
-                    epoch, split_name, spearman)
-                )
-                store_checkpoint(output_dir, "{:04d}.pth".format(epoch), model, epoch, spearman)
+                save_checkpoint(output_dir, "best.pth", model, q_mapper, scaler, optimizer, epoch, spearman)
 
     # training/validation is complete
     if global_config["do_test"]:
         print("Doing Test.")
 
         # if training was done during the current session, reload the best saved model from the current session
-        if global_config["do_train"]:
-            model = get_model(device, is_full_reference_iqa, "{}/best.pth".format(output_dir))
+        if global_config["do_train"] and not is_debug:
+            model = get_model(
+                device,
+                is_full_reference_iqa,
+                "{}/{}.pth".format(
+                    output_dir,
+                    "latest" if (global_config["test_use_latest"] and global_config["train_save_latest"]) else "best"
+                )
+            )
 
         step, correlations = do_validation(scaler, SPLIT_NAME_TEST, test_loader, 0, log_writer=False, save_test_outputs=True)
         spearman, kendall, pearson, rmse = correlations
@@ -702,19 +778,20 @@ def main():
                '{}={}\n'.format(KROCC_FIELD, kendall) +
                '{}={}\n'.format(PLCC_FIELD, pearson) +
                '{}={}\n'.format(RMSE_FIELD, rmse)
-               )
+        )
 
         results = get_results_dict(*correlations)
 
     if not is_debug:
         writer.close()
 
-    # del model
-    # del optimizer
-    # del train_loader
-    # del val_loader
-    # del test_loader
-    torch.cuda.empty_cache()  # release all used video memory; this helps when train() is performed multiple times
+    # post training cleanup
+    del model
+    del optimizer
+    del train_loader
+    del val_loader
+    del test_loader
+    torch.cuda.empty_cache()  # release used VRAM; this helps when train() is performed multiple times
 
     return results
 

@@ -1,4 +1,19 @@
+# Copyright 2020 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # coding=utf-8
+
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -14,6 +29,21 @@ from scipy import ndimage
 
 from torch.nn import Dropout, Softmax, Linear, LayerNorm
 from collections import OrderedDict
+
+
+ATTENTION_Q = "MultiHeadDotProductAttention_1/query"
+ATTENTION_K = "MultiHeadDotProductAttention_1/key"
+ATTENTION_V = "MultiHeadDotProductAttention_1/value"
+ATTENTION_OUT = "MultiHeadDotProductAttention_1/out"
+FC_0 = "MlpBlock_3/Dense_0"
+FC_1 = "MlpBlock_3/Dense_1"
+ATTENTION_NORM = "LayerNorm_0"
+MLP_NORM = "LayerNorm_2"
+
+VIT_VARIANT_B16 = "ViT-B16"
+VIT_VARIANT_L16 = "ViT-L16"
+
+ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu}
 
 
 def get_b16_config():
@@ -49,30 +79,15 @@ def get_l16_config():
 
 
 def get_vit_config(variant):
-    _b16 = "B16"
-    _l16 = "L16"
-    if variant == _b16:
+    if variant == VIT_VARIANT_B16:
         vit_config = get_b16_config()
-    elif variant == _l16:
+    elif variant == VIT_VARIANT_L16:
         vit_config = get_l16_config()
     else:
         raise ValueError("ViT: Unsupported variant [{}], pick from [{}, {}].".format(
-            variant, _b16, _l16
+            variant, VIT_VARIANT_B16, VIT_VARIANT_L16
         ))
     return vit_config
-
-
-# logger = logging.getLogger(__name__)
-
-
-ATTENTION_Q = "MultiHeadDotProductAttention_1/query"
-ATTENTION_K = "MultiHeadDotProductAttention_1/key"
-ATTENTION_V = "MultiHeadDotProductAttention_1/value"
-ATTENTION_OUT = "MultiHeadDotProductAttention_1/out"
-FC_0 = "MlpBlock_3/Dense_0"
-FC_1 = "MlpBlock_3/Dense_1"
-ATTENTION_NORM = "LayerNorm_0"
-MLP_NORM = "LayerNorm_2"
 
 
 def pjoin(*args):
@@ -84,13 +99,6 @@ def np2th(weights):
     if weights.ndim == 4:
         weights = weights.transpose([3, 2, 0, 1])
     return torch.from_numpy(weights)
-
-
-def swish(x):
-    return x * torch.sigmoid(x)
-
-
-ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu, "swish": swish}
 
 
 class Attention(nn.Module):
@@ -175,9 +183,9 @@ class Mlp(nn.Module):
         return x
 
 
-class Block(nn.Module):
+class Layer(nn.Module):
     def __init__(self, config, vis):
-        super(Block, self).__init__()
+        super(Layer, self).__init__()
 
         hidden_size = config["hidden_size"]
 
@@ -202,10 +210,13 @@ class Block(nn.Module):
     def load_from(self, weights, n_block):
         ROOT = f"Transformer/encoderblock_{n_block}"
         with torch.no_grad():
-            query_weight = np2th(weights[pjoin(ROOT, ATTENTION_Q, "kernel")]).view(self.hidden_size, self.hidden_size).t()
+            query_weight = np2th(weights[pjoin(ROOT, ATTENTION_Q, "kernel")]).view(self.hidden_size,
+                                                                                   self.hidden_size).t()
             key_weight = np2th(weights[pjoin(ROOT, ATTENTION_K, "kernel")]).view(self.hidden_size, self.hidden_size).t()
-            value_weight = np2th(weights[pjoin(ROOT, ATTENTION_V, "kernel")]).view(self.hidden_size, self.hidden_size).t()
-            out_weight = np2th(weights[pjoin(ROOT, ATTENTION_OUT, "kernel")]).view(self.hidden_size, self.hidden_size).t()
+            value_weight = np2th(weights[pjoin(ROOT, ATTENTION_V, "kernel")]).view(self.hidden_size,
+                                                                                   self.hidden_size).t()
+            out_weight = np2th(weights[pjoin(ROOT, ATTENTION_OUT, "kernel")]).view(self.hidden_size,
+                                                                                   self.hidden_size).t()
 
             query_bias = np2th(weights[pjoin(ROOT, ATTENTION_Q, "bias")]).view(-1)
             key_bias = np2th(weights[pjoin(ROOT, ATTENTION_K, "bias")]).view(-1)
@@ -256,7 +267,7 @@ class Encoder(nn.Module):
         self.encoder_norm = LayerNorm(hidden_size, eps=1e-6)
         self.layer = nn.ModuleList()
         for _ in range(num_layers):
-            layer = Block(config, vis)
+            layer = Layer(config, vis)
             self.layer.append(copy.deepcopy(layer))
 
     def forward(self, hidden_states):
@@ -280,15 +291,13 @@ class ScaleEmbedding(nn.Module):
         self.scale_embeddings = nn.Parameter(torch.zeros(1, self.num_scales + 1, hidden_size))
 
     def forward(self, scale):
-        # scale = torch.floor(scale * self.num_scales) + 1  # offset for cls token
-        # print('scale', float(scale.min()), float(scale.max()))
-        scale = torch.clamp(scale, 0, self.num_scales) + 1  # offset for cls token
+        scale = torch.clamp(scale[:, 0], 0, self.num_scales - 1) + 1  # offset for cls token
         scale = scale.to(dtype=torch.long)
-        scale = self.scale_embeddings[:, scale[:, 0]]
+        scale = self.scale_embeddings[:, scale]
         return scale
 
     def forward_cls_token(self):
-        return self.scale_embeddings[:, 0]
+        return self.scale_embeddings[:, 0]  # first embedding is cls token
 
 
 class UvPosEmbedding(nn.Module):
@@ -303,6 +312,7 @@ class UvPosEmbedding(nn.Module):
         self.positional_embeddings = nn.Parameter(torch.zeros(1, num_pos_embeddings, hidden_size))
 
     def forward(self, pos):
+        # print('pos', float(pos.min()), float(pos.max()))
         pos = torch.floor(pos * self.width_pos_embeddings)
         pos = (pos[:, 0] * self.width_pos_embeddings + pos[:, 1]) + 1  # +1 offset to step over cls token embedding
         pos = pos.to(dtype=torch.long)
@@ -345,8 +355,11 @@ class UvPosEmbedding(nn.Module):
 class Embeddings(nn.Module):
     def __init__(self,
                  config,
+                 use_cls_token=True,
                  dropout=0.2,
                  img_dim=384,
+                 use_patch_embedding=True,
+                 use_pos_embedding=True,
                  use_scale_embedding=False,
                  ):
         super(Embeddings, self).__init__()
@@ -355,49 +368,62 @@ class Embeddings(nn.Module):
         patch_size = config["patch_size"]
 
         # "RGB" tensor to hidden_size dimension
-        self.patch_embeddings = nn.Conv2d(in_channels=3,
-                                          out_channels=hidden_size,
-                                          kernel_size=patch_size,
-                                          stride=patch_size)
+        self.use_patch_embedding = use_patch_embedding
+        if use_patch_embedding:
+            self.patch_embeddings = nn.Conv2d(in_channels=3,
+                                              out_channels=hidden_size,
+                                              kernel_size=patch_size,
+                                              stride=patch_size)
 
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size), requires_grad=True)
+        self.use_cls_token = use_cls_token
+        if use_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size), requires_grad=True)
 
-        self.positional_embeddings = UvPosEmbedding(config, img_dim)
+        self.use_pos_embedding = use_pos_embedding
+        if use_pos_embedding:
+            self.positional_embeddings = UvPosEmbedding(config, img_dim)
 
         self.use_scale_embedding = use_scale_embedding
         if use_scale_embedding:
-            print("VTAMIQ: using ScaleEmbedding.")
             self.scale_embeddings = ScaleEmbedding(config)
 
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, pos, scales=None):
-        B, N, C, P, P = x.shape
+        if len(x.shape) == 5:
+            B, N, C, P, P = x.shape
 
-        # compute patch embeddings
-        cls_tokens = self.cls_token.expand(B, -1, -1)
+            # compute patch embeddings
+            x = x.view(B * N, C, P, P)
+            x = self.patch_embeddings(x)
+        else:  # B, N, H
+            B, N, _ = x.shape
 
-        x = x.view(B * N, C, P, P)
-        x = self.patch_embeddings(x)
         x = x.view(B, N, -1)  # BxNxH
 
+        if self.use_cls_token:
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+
         # add positional embeddings
-        pos = pos.view(B * N, 2)
-        pos = self.positional_embeddings(pos)
-        pos = pos.view(B, N, -1)
-        x = x + pos  # BxNxH
-        cls_tokens = cls_tokens + self.positional_embeddings.forward_cls_token()
+        if self.use_pos_embedding:
+            pos = pos.view(B * N, 2)
+            pos = self.positional_embeddings(pos)
+            pos = pos.view(B, N, -1)
+            x = x + pos  # BxNxH
+            if self.use_cls_token:
+                cls_tokens = cls_tokens + self.positional_embeddings.forward_cls_token()
 
         # add scale embeddings
         if self.use_scale_embedding and scales is not None:
-            scales = scales.view(B * N, 2)
+            scales = scales.reshape(B * N, 2)
             scales = self.scale_embeddings(scales)
             scales = scales.view(B, N, -1)
-
             x = x + scales
-            cls_tokens = cls_tokens + self.scale_embeddings.forward_cls_token()
+            if self.use_cls_token:
+                cls_tokens = cls_tokens + self.scale_embeddings.forward_cls_token()
 
-        x = torch.cat((cls_tokens, x), dim=1)
+        if self.use_cls_token:
+            x = torch.cat((cls_tokens, x), dim=1)
 
         x = self.dropout(x)
 
@@ -405,28 +431,52 @@ class Embeddings(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, num_keep_layers=1, use_scale_embedding=False, vis=False, token=True):
+    def __init__(self,
+                 config,
+                 num_keep_layers=-1,
+                 use_patch_embedding=True,
+                 use_pos_embedding=True,
+                 use_scale_embedding=False,
+                 vis=False,
+                 use_cls_token=True,
+                 pretrained=False,
+                 ):
         super(VisionTransformer, self).__init__()
-        self.embeddings = Embeddings(config, use_scale_embedding=use_scale_embedding)
+        self.embeddings = Embeddings(
+            config,
+            use_patch_embedding=use_patch_embedding,
+            use_pos_embedding=use_pos_embedding,
+            use_scale_embedding=use_scale_embedding,
+            use_cls_token=use_cls_token,
+        )
         self.encoder = Encoder(config, num_keep_layers, vis)
-        self.token = token
+        self.use_cls_token = use_cls_token
+        if pretrained:
+            vit_weights_path = config["vit_weights_path"]
+            print("ViT: Loading pretrained transformer from path:", vit_weights_path)
+            self.load_from(np.load(vit_weights_path), use_patch_embedding, use_pos_embedding, use_cls_token)
 
     def forward(self, x, pos, scales):
-        x = self.embeddings(x, pos, scales)  # this will reshape BxNxCxPxP into B x N+1 x H
+        x = self.embeddings(x, pos, scales)  # this will transform BxNxCxPxP into B x N+1 x H
         x, attn_weights = self.encoder(x)
-        if self.token:
-            x = x[:, 0]  # cls_token only
+        x = x[:, 0] if self.use_cls_token else x  # cls_token only (B x 1 x H) or full B x N+1 x H
+        x = (x, attn_weights) if self.encoder.vis else x
         return x
 
-    def load_from(self, weights):
+    def load_from(self, weights, use_patch_embedding, use_pos_embedding, use_cls_token):
         with torch.no_grad():
-            self.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"]))
-            self.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
-            self.embeddings.cls_token.copy_(np2th(weights["cls"]))
+            if use_patch_embedding:
+                self.embeddings.patch_embeddings.weight.copy_(np2th(weights["embedding/kernel"]))
+                self.embeddings.patch_embeddings.bias.copy_(np2th(weights["embedding/bias"]))
+
+            if use_cls_token:
+                self.embeddings.cls_token.copy_(np2th(weights["cls"]))
+
+            if use_pos_embedding:
+                self.embeddings.positional_embeddings.load_from(weights)
+
             self.encoder.encoder_norm.weight.copy_(np2th(weights["Transformer/encoder_norm/scale"]))
             self.encoder.encoder_norm.bias.copy_(np2th(weights["Transformer/encoder_norm/bias"]))
-
-            self.embeddings.positional_embeddings.load_from(weights)
 
             for bname, block in self.encoder.named_children():
                 for uname, unit in block.named_children():

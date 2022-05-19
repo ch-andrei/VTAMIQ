@@ -15,6 +15,7 @@ class PieAPPTrainPairwise(PairwiseFRIqaPatchDataset):
         super(PieAPPTrainPairwise, self).__init__(
             name=name,
             path=path,
+            # Note: PairwiseFRIqaPatchDataset has all data processing disabled
             **kwargs
         )
 
@@ -70,6 +71,8 @@ class PieAPPTestset(FRIqaPatchDataset):
             name=name,
             path=path,
             qs_reverse=False,  # no need to compute "q = 1.0 - q"
+            qs_normalize=False,
+            qs_linearize=False,
             **kwargs
         )
 

@@ -1,12 +1,9 @@
-import numpy as np
-
 from data.datasets.iqa_datasets import FRIqaPatchDataset
-from utils.image_tools import normalize_array
 
 
 class KADIS700kDataset(FRIqaPatchDataset):
     # the full dataset should have ~140000 images with 5 distortions;
-    # distortion 15 was too slow to generate using the originally provided MATLAB script so it was skipped.
+    # distortion 15 was too slow to compute using the original generation script so it was skipped.
     # total number of distorted images in dataset is 700000; without distortion 15 which has 28700 denoise images,
     # there are now (700000 - 28700) = 671300 -> 671300 / 5 = 134260 ref images
     num_ref_images = 134260  # 134260 * 5 = 671300
@@ -71,18 +68,18 @@ class KADIS700kDataset(FRIqaPatchDataset):
     def __init__(self,
                  path='I:/Datasets/kadis700k',
                  preprocess=True,
-                 kadis_version=2,  # 0 for original, 1 and 2 for modified
+                 kadis_version=1,  # 0 for original, 1 and 2 for modified
                  **kwargs
                  ):
 
         self.preprocess = preprocess
 
         if kadis_version == 0:
-            self.scores_file = "kadis700k_friqa_no15.csv"
+            self.scores_file = "kadis700k_friqa_no15.csv"  # original
         elif kadis_version == 1:
-            self.scores_file = "kadis700k_vtamiq.csv"
+            self.scores_file = "kadis700k_vtamiq.csv"  # vtamiq trained on kadid
         elif kadis_version == 2:
-            self.scores_file = "kadis700k_v2.csv"
+            self.scores_file = "kadis700k_v2.csv"  # vtamiq trained on display model and PU encoded pieapp
         else:
             raise ValueError("Incorrect dataset version selected.")
 
@@ -90,6 +87,7 @@ class KADIS700kDataset(FRIqaPatchDataset):
             path=path,
             name="KADIS700k",
             qs_reverse=False,
+            qs_linearize=False,
             **kwargs
         )
 
@@ -144,27 +142,4 @@ class KADIS700kDataset(FRIqaPatchDataset):
 
         data = super().process_data(data)
 
-        # on top of the regular data processing, KADIS also needs to apply a normalzing fit for the Q values
-
-        qs = data[-1]
-
-        from utils.correlations import FitFunction
-
-        qs_counts = np.arange(len(qs))
-        qs_lin = qs_counts.flatten() / len(qs)
-        qs_sort = np.sort(qs)
-        try:
-            fit_function = FitFunction(qs_sort, qs_lin)
-            qs_lin = fit_function(qs)
-            qs_lin = normalize_array(qs_lin)
-
-            from matplotlib import pyplot as plt
-            plt.plot(qs_sort, qs_counts, 'ro', markersize=0.5, label='before hist eq.')
-            plt.plot(normalize_array(fit_function(qs_sort)), qs_counts, 'bo', markersize=0.5, label='after hist eq.')
-            plt.legend()
-            plt.show()
-        except OverflowError:
-            print(self.name, ": Overflow during Q array linear fit. Using raw quality values instead.")
-            qs_lin = qs
-
-        return data[:-1] + (qs_lin, )
+        return data

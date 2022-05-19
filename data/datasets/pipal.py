@@ -15,6 +15,9 @@ class PIPAL(FRIqaPatchDataset):
         super(PIPAL, self).__init__(
             name=name,
             path=path,
+
+            # qs_linearize=False,
+
             **kwargs
         )
 
@@ -66,11 +69,10 @@ class PIPALTest(PIPAL):
 
         super(PIPALTest, self).__init__(
             name=name,
-            # disable all q preprocessing
+            qs_plot=False,
             qs_normalize=False,
             qs_reverse=False,
-            qs_linearize=False,
-            qs_linearize_plot=False,
+            qs_normalize_mean_std=False,
             **kwargs
         )
 
@@ -113,62 +115,29 @@ class PIPALVal(PIPALTest):
         )
 
 
-if __name__ == "__main__":
-    # preprocess for NTIRE2021 competition submission format
+class PIPALVal22(PIPALTest):
+    num_ref_images = 25
+    num_dist_images = 66
 
-    pipal = PIPALTest()
-    path = "./output/1623772844-PIPALVal-p16-VTAMIQ-B16-6L-4R-5e-18b-256p-TESTSET"
-    vtamiq_file_name = "test.txt"
-    output_file_name = "output.txt"
-    pipal_test_distored_path = pipal.path + "/Val_Dist"
-    dist_files = os.listdir(pipal_test_distored_path)
-    output_path = path + "/submission"
+    def __init__(self,
+                 **kwargs
+                 ):
+        super(PIPALVal22, self).__init__(
+            name="PIPALVal22",
+            suffix="NTIRE2022_FR_Valid",
+            **kwargs
+        )
 
-    # read predictions
-    qs = []
-    with open("{}/{}".format(path, vtamiq_file_name), 'r') as input_file:
-        for line in input_file:
-            line = line.strip()
-            line = line.split(" ")
-            line = line[2].split(",")
-            for q in line:
-                qs.append(float(q))
 
-    # normalize
-    qs = np.array(qs)
-    qs -= qs.min()
-    qs /= qs.max()
+class PIPALTest22(PIPALTest):
+    num_ref_images = 25
+    num_dist_images = 66
 
-    # sort
-    scores = []
-    for dist_file, q in zip(dist_files, qs):
-        scores.append((dist_file, q))
-    scores = sorted(scores, key=lambda x: x[0])
-
-    # build output folders
-    os.makedirs(output_path, exist_ok=True)
-
-    # write predictions file
-    # assume predictions have the same order as file names (should be the case when shuffle=False in dataset)
-    with open("{}/{}".format(output_path, output_file_name), 'w') as output_file:
-        for name, q in scores:
-            output_file.write("{},{}\n".format(name, q))
-
-    # write readme file
-    with open("{}/{}".format(output_path, "readme.txt"), 'w') as output_file:
-        output_file.write("runtime per image [s] : 0.01\n"
-                          "CPU[1] / GPU[0] : 1\n"
-                          "Extra Data [1] / No Extra Data [0] : 1\n"
-                          "Other description : RTC\n"
-                          "Full-Reference [1] / Non-Reference [0] : 1\n"
-                          )
-
-    # zip everything
-    import zipfile
-
-    output_files = os.listdir(output_path)
-    zipf = zipfile.ZipFile(output_path + "/submission.zip", 'w', zipfile.ZIP_DEFLATED)
-    for file in output_files:
-        zipf.write(os.path.join(output_path, file), file)
-
-    zipf.close()
+    def __init__(self,
+                 **kwargs
+                 ):
+        super(PIPALTest22, self).__init__(
+            name="PIPALTest22",
+            suffix="NTIRE2022_FR_Testing",
+            **kwargs
+        )
