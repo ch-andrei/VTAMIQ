@@ -39,6 +39,7 @@ which by design considers interdependencies between patches. We rely on various 
 mechanisms -- first with self-attention within the Transformer, and second with channel 
 attention within our difference modulation network -- specifically to reveal and enhance 
 the more salient features throughout our architecture. With large-scale pre-training for 
+both classification and IQA tasks, VTAMIQ generalizes well to unseen sets of images and distortions, 
 further demonstrating the strength of transformer-based networks for vision modelling.
 
 ## VTAMIQ Summary
