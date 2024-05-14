@@ -2,8 +2,8 @@ import time
 
 from utils.logging import FileLogger
 
-import run_main
-from run_config import *
+import train
+from train_config import *
 
 
 def parse_runs(runs, logger):
@@ -44,7 +44,7 @@ def main():
     global_config["scheduler_type"] = "multistep"
     global_config["optimizer_learning_rate_decay_multistep"] = 0.1
 
-    output_dir = "./output/{}-multirun-{}".format(int(time.time()), DATASET_USED())
+    output_dir = "./output/{}-multirun-{}".format(int(time.time()), dataset_target())
     output_file = "results.txt"
 
     os.makedirs(output_dir, exist_ok=True)
@@ -54,9 +54,9 @@ def main():
     for i in range(num_runs):
         logger("Starting run", i)
         global_config["output_dir"] = output_dir  # tell the script to write to cross-validation folder
-        run_ = run_main.main()  # get results
-        logger("Finished run", i, ":", run_)
-        runs.append(run_)
+        run = train.train()  # get results
+        logger("Finished run", i, ":", run)
+        runs.append(run)
 
     parse_runs(runs, logger)
 

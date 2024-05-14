@@ -1,7 +1,10 @@
-from data.datasets.iqa_datasets import FRIqaPatchDataset
+import numpy as np
+
+from data.patch_datasets import PatchFRIQADataset
+from utils.logging import log_warn
 
 
-class KADIS700kDataset(FRIqaPatchDataset):
+class KADIS700kDataset(PatchFRIQADataset):
     # the full dataset should have ~140000 images with 5 distortions;
     # distortion 15 was too slow to compute using the original generation script so it was skipped.
     # total number of distorted images in dataset is 700000; without distortion 15 which has 28700 denoise images,
@@ -66,28 +69,29 @@ class KADIS700kDataset(FRIqaPatchDataset):
     #  'sharpenHi': 28090}
 
     def __init__(self,
-                 path='I:/Datasets/kadis700k',
-                 preprocess=True,
-                 kadis_version=1,  # 0 for original, 1 and 2 for modified
+                 preprocess=False,  # can disable Q preprocessing
+                 version=1,  # 0 for original, 1 and 2 for modified
                  **kwargs
                  ):
 
         self.preprocess = preprocess
+        self.version = version
 
-        if kadis_version == 0:
+        if version == 0:
             self.scores_file = "kadis700k_friqa_no15.csv"  # original
-        elif kadis_version == 1:
+        elif version == 1:
             self.scores_file = "kadis700k_vtamiq.csv"  # vtamiq trained on kadid
-        elif kadis_version == 2:
-            self.scores_file = "kadis700k_v2.csv"  # vtamiq trained on display model and PU encoded pieapp
+        elif version == 2:
+            self.scores_file = "kadis700k_v2.csv"  # vtamiq trained on display model and PU-encoded pieapp
         else:
             raise ValueError("Incorrect dataset version selected.")
 
         super(KADIS700kDataset, self).__init__(
-            path=path,
+            path="kadis700k",
             name="KADIS700k",
             qs_reverse=False,
             qs_linearize=False,
+            use_ref_img_cache=False,  # the dataset is too large for caching the reference images
             **kwargs
         )
 
@@ -97,6 +101,13 @@ class KADIS700kDataset(FRIqaPatchDataset):
         """
         reference_images_path = self.path + "/kadis700k/ref_imgs"
         distorted_images_path = self.path + "/kadis700k/dist_imgs"
+
+        q_index = 6 if self.version == 0 else -1  # VSI for original version of KADIS or VTAMIQ for customized
+        # q_vsi = float(line[6])
+        # q_mdsi = float(line[5])
+        # q_fsim = float(line[7])
+        # q_sff = float(line[9])
+        # q_vtamiq = float(line[-1])
 
         paths_ref, paths_dist, qs = [], [], []
         q_file_path = self.path + "/" + self.scores_file
@@ -120,26 +131,17 @@ class KADIS700kDataset(FRIqaPatchDataset):
 
                 path_distorted = "{}_{:02d}_{:02d}.bmp".format(path_reference[:-4], distortion_type_digit, distortion_level)
 
-                q_v = float(line[-1])
-                # q_mdsi = float(line[5])
-                # q_vsi = float(line[6])
-                # q_fsim = float(line[7])
-                # q_sff = float(line[9])
-
-                q = q_v
+                q = float(line[q_index])
 
                 paths_ref.append(reference_images_path + '/' + path_reference)
                 paths_dist.append(distorted_images_path + '/' + path_distorted)
                 qs.append(q)
 
-        return paths_ref, paths_dist, qs
+        dist_images_per_image = [self.num_dist_images for _ in range(self.num_ref_images)]
+        self.process_dataset_data(qs, paths_ref, paths_dist, dist_images_per_image)
 
-    def process_data(self, data):
-        print(self.name, "processing Q array. This will take about 20s...")
-
-        if not self.preprocess:
-            return data
-
-        data = super().process_data(data)
-
-        return data
+    def process_qs(self):
+        if self.preprocess:
+            log_warn(f"Dataset {self.name} running self.process_qs()...")
+            super().process_qs()
+            log_warn(f"Dataset {self.name} self.process_qs() completed.")

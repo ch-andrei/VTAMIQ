@@ -1,210 +1,119 @@
-import numpy as np
 from torch import nn
 import torch
 
+from modules.VisionTransformer.backbone import VisionTransformerBackbone
+from modules.RCAN.channel_attention import ResidualGroup
+from modules.VisionTransformer.transformer import LayerScale
 
-from modules.Attention.ViT.transformer import VisionTransformer, get_vit_config, VIT_VARIANT_B16, VIT_VARIANT_L16
-from modules.RCAN.rcan_channel_attention import ResidualGroup, ResidualGroupXY
-
-
-def set_grad(layer, requires_grad):
-    for param in layer.parameters():
-        param.requires_grad = requires_grad
+from modules.utils import set_grad
+from utils.misc.miscelaneous import check_unused_kwargs
 
 
-# preprocessing module for quality predictions used to remap Q from VTAMIQ for preference judgement (as in PieAPP)
-class QMapper(nn.Module):
-    def __init__(self, hidden=4, non_lin_act=False, sigmoid=False, batch_norm=False):
-        super(QMapper, self).__init__()
-        self.q_map = nn.Sequential(
-            nn.Linear(1, hidden),
-            nn.PReLU() if non_lin_act else nn.Sequential(),
-            nn.BatchNorm1d(hidden) if batch_norm else nn.Sequential(),
-            nn.Linear(hidden, 1),
-            nn.Sigmoid() if sigmoid else nn.Sequential(),
-        )
-
-    def forward(self, x):
-        # x = torch.stack([q1, q2], dim=1)
-        x = x.view(-1, 1)
-        x = self.q_map(x)
-        return x.flatten()
-
-
-class VisionTransformerBackbone(nn.Module):
-    def __init__(self,
-                 variant=VIT_VARIANT_B16,
-                 load_pretrained=True,
-                 num_keep_layers=-1,
-                 use_patch_embedding=True,
-                 use_pos_embedding=True,
-                 use_scale_embedding=False,
-                 use_cls_token=True,
-                 return_attention=False,
-                 ):
-
-        super(VisionTransformerBackbone, self).__init__()
-
-        vit_config = get_vit_config(variant)
-        self.transformer = self.get_transformer(
-            vit_config,
-            num_keep_layers,
-            use_patch_embedding,
-            use_pos_embedding,
-            use_scale_embedding,
-            load_pretrained,
-            use_cls_token,
-            return_attention,
-        )
-
-        self.hidden_size = vit_config["hidden_size"]
-
-    @staticmethod
-    def get_transformer(config,
-                        num_keep_layers,
-                        use_patch_embedding,
-                        use_pos_embedding,
-                        use_scale_embedding,
-                        load_pretrained,
-                        use_cls_token,
-                        return_attention=False,
-                        ):
-        return VisionTransformer(
-            config,
-            num_keep_layers=num_keep_layers,
-            use_patch_embedding=use_patch_embedding,
-            use_pos_embedding=use_pos_embedding,
-            use_scale_embedding=use_scale_embedding,
-            use_cls_token=use_cls_token,
-            pretrained=load_pretrained,
-            vis=return_attention
-        )
-
-    def set_freeze_state(self, freeze_state, freeze_dict):
-        requires_grad = not freeze_state
-
-        if freeze_dict["freeze_encoder"]:
-            set_grad(self.transformer.encoder, requires_grad)
-
-        if freeze_dict["freeze_embeddings_patch"]:
-            self.transformer.embeddings.cls_token.requires_grad = requires_grad
-            set_grad(self.transformer.embeddings.patch_embeddings, requires_grad)
-
-        if freeze_dict["freeze_embeddings_pos"] and self.transformer.embeddings.use_pos_embedding:
-            set_grad(self.transformer.embeddings.positional_embeddings, requires_grad)
-
-        if freeze_dict["freeze_embeddings_scale"] and self.transformer.embeddings.use_scale_embedding:
-            set_grad(self.transformer.embeddings.scale_embeddings, requires_grad)
+def get_quality_decoder(
+        dim, num_rgs, num_rcabs, ca_reduction, rg_path_drop=0., use_ms_cam=False, use_local=False):
+    return nn.Sequential(
+        *[
+            ResidualGroup(
+                dim, num_rcabs, reduction=ca_reduction, path_drop_prob=rg_path_drop,
+                use_bn=False, use_ms_cam=use_ms_cam, use_local=use_local, input1d=True
+            )
+            for _ in range(num_rgs)
+        ],
+        nn.Conv1d(dim, dim, kernel_size=1),
+    )
 
 
 class VTAMIQ(VisionTransformerBackbone):
-    def __init__(self,
-                 vit_variant,
-                 vit_load_pretrained=True,
-                 vit_num_keep_layers=-1,
-                 vit_use_scale_embedding=False,
-                 num_residual_groups=4,
-                 num_rcabs_per_group=4,
-                 dropout=0.1,
-                 is_full_reference=False,
-                 use_diff_embedding=False,
-                 **kwargs
-                 ):
-        return_attention = kwargs.pop("return_attention", False)
+    def __init__(
+            self,
+            vit_config=None,
 
-        super(VTAMIQ, self).__init__(
-            variant=vit_variant,
-            load_pretrained=vit_load_pretrained,
-            num_keep_layers=vit_num_keep_layers,
-            use_pos_embedding=True,
-            use_scale_embedding=vit_use_scale_embedding,
-            use_cls_token=True,
-            return_attention=return_attention,
+            # calibration network params
+            calibrate=True,
+            diff_scale=True,
+            num_rgs=4,
+            num_rcabs=4,
+            rg_path_drop=0.1,
+            ca_reduction=8,
+
+            # quality predictor params
+            predictor_dropout=0.,
+
+            # misc params
+            return_features=False,
+
+            **kwargs
+    ):
+        if vit_config is None:
+            vit_config = {}
+        check_unused_kwargs("VTAMIQ", **kwargs)
+        vit_config.pop("use_classifier", None)  # ViT should not return class labels, only features
+        super().__init__(
+            use_classifier=False,  # always disable classifier
+            **vit_config,
+            **kwargs
         )
 
-        if 0 < len(kwargs):
-            print("WARNING: VTAMIQ has unused kwargs={}".format(kwargs))
+        self.token_num = 0  # ViT has 1 CLS token and N register tokens; which token to use (0 -> CLS, 1 -> 1st reg)
 
-        self.use_diff_embedding = use_diff_embedding
-        self.is_full_reference = is_full_reference
-        self.dropout = dropout
+        hidden_size = self.vit_hidden_size
 
-        if self.use_diff_embedding:
-            # uses a residual group with special multiplicative connection
-            # between the reference image f_ref and the difference signal (f_ref - f_dist)
-            # thus incorporating f_ref in the first step of the difference modulation stage
-            print("VTAMIQ: using difference embedding.")
-            self.diff_embedding = ResidualGroupXY(self.hidden_size, num_rcabs_per_group, reduction=16)
+        self.diff_scale = LayerScale(hidden_size, init_values=1.0) if diff_scale else nn.Sequential()
 
-        self.diff_net = nn.Sequential(
-            *[ResidualGroup(self.hidden_size, num_rcabs_per_group, reduction=16) for _ in range(num_residual_groups)],
-            nn.Conv2d(self.hidden_size, self.hidden_size, kernel_size=1, bias=True)
-        )
+        if calibrate:
+            self.quality_decoder = get_quality_decoder(
+                hidden_size, num_rgs, num_rcabs, ca_reduction,
+                rg_path_drop=rg_path_drop)
+        else:
+            self.quality_decoder = nn.Sequential()
 
+        self.predictor_dropout = predictor_dropout
         self.q_predictor = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(self.hidden_size, self.hidden_size // 4),
+            nn.Dropout(predictor_dropout),
+            nn.Linear(hidden_size, hidden_size // 4),
             nn.PReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(self.hidden_size // 4, 1),
+            nn.Dropout(predictor_dropout),
+            nn.Linear(hidden_size // 4, 1),
         )
 
-    def set_freeze_state(self,
-                         freeze_state,
-                         freeze_dict,
-                         ):
+        self.return_features = return_features
+
+    def set_freeze_state(self, freeze_state, freeze_dict):
         print("VTAMIQ: Setting freeze state to", freeze_state)
 
-        super().set_freeze_state(freeze_state, freeze_dict)
+        super().set_freeze_state(freeze_state, freeze_dict["freeze_dict_vit"])
 
         requires_grad = not freeze_state
 
-        if freeze_dict["freeze_diffnet"]:
-            set_grad(self.diff_net, requires_grad)
+        if freeze_dict["freeze_quality_decoder"]:
+            set_grad(self.quality_decoder, requires_grad)
 
         if freeze_dict["freeze_q_predictor"]:
             set_grad(self.q_predictor, requires_grad)
 
-    def forward_fr(self, patches, patches_pos, patches_scales):
+    def forward(self, patches, pos, scales):
         patches_ref, patches_dist = patches
+        pos_ref, pos_dist = pos
+        scales_ref, scales_dist = scales
 
-        B, N, C, P, P = patches_ref.shape
+        # feats shape: B x (num_tokens + num_patches) x hidden_size
+        feats_ref, _, _ = self.forward_vit(patches_ref, pos_ref, scales_ref, tokens_only=True)
+        feats_dist, _, _ = self.forward_vit(patches_dist, pos_dist, scales_dist, tokens_only=True)
+        B = patches_ref.shape[0]
 
-        feats_ref = self.transformer(patches_ref, patches_pos, patches_scales)
-        feats_dist = self.transformer(patches_dist, patches_pos, patches_scales)
-        feats = feats_ref - feats_dist
+        feats_ref = torch.permute(feats_ref, (0, 2, 1))
+        feats_dist = torch.permute(feats_dist, (0, 2, 1))
 
-        feats = feats.view(B, -1, 1, 1)  # B x H x 1 x 1
+        cls_ref = feats_ref[..., self.token_num]
+        cls_dist = feats_dist[..., self.token_num]
+        # [..., self.token_num] to select only the IQA token (can be CLS token or extra_token)
 
-        if self.use_diff_embedding:
-            feats_ref = feats_ref.view(B, -1, 1, 1)  # B x H x 1 x 1
-            feats = self.diff_embedding(feats, feats_ref)
+        cls_diff = self.diff_scale(cls_ref - cls_dist)  # CLS + extra tokens
 
-        feats = self.diff_net(feats)
-        feats = feats.view(B, -1)  # B x H
-        q = self.q_predictor(feats)
-        # q = q.flatten()
+        # calibrate difference vector
+        cls_diff = self.quality_decoder(cls_diff.view(B, -1, 1))  # .view(B, -1, 1) reshapes to B x H x 1
 
-        return q
+        cls_diff = cls_diff.view(B, -1)  # B x H
+        q = self.q_predictor(cls_diff).flatten()
 
-    def forward_nr(self, patches, patches_pos, patches_scales):
-        patches_ref = patches[0]
-
-        B, N, C, P, P = patches_ref.shape
-
-        feats = self.transformer(patches_ref, patches_pos, patches_scales)
-
-        feats = feats.view(B, -1, 1, 1)  # B x H x 1 x 1
-        feats = self.diff_net(feats)
-
-        feats = feats.view(B, -1)  # B x H
-        q = self.q_predictor(feats)
-        # q = q.flatten()
-
-        return q
-
-    def forward(self, patches, patches_pos, patches_scales):
-        if self.is_full_reference:
-            return self.forward_fr(patches, patches_pos, patches_scales)
-        else:
-            return self.forward_nr(patches, patches_pos, patches_scales)
+        return q, None

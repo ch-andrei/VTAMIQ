@@ -1,13 +1,14 @@
 import numpy as np
-from data.datasets.iqa_datasets import NRIqaPatchDataset
+from data.patch_datasets import NRIqaPatchDataset
 
 
+# TODO: fix this
 class KONIQ10k(NRIqaPatchDataset):
     num_ref_images = 10073
     num_dist_images = 1
 
     def __init__(self,
-                 path='I:/Datasets/koniq10k',
+                 path='koniq10k',
                  resolution="half",
                  use_mos_zscore=False,
                  **kwargs
@@ -57,4 +58,5 @@ class KONIQ10k(NRIqaPatchDataset):
                 paths.append(path)
                 qs.append(q)
 
-        return paths, qs
+        self.qs = qs
+        self.paths = paths

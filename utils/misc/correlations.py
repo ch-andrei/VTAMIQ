@@ -1,14 +1,24 @@
 import scipy.stats
 import scipy.optimize
 import numpy as np
+from matplotlib import pyplot as plt
+from utils.image_processing.image_tools import normalize_array
+from utils.logging import log_warn
+from utils.misc.miscelaneous import float2str3
 
-from utils.image_tools import normalize_array
 
-
+# constants and defs
 CORRELATIONS_EPS = 1e-6
 
+SROCC_FIELD = 'SROCC'
+KROCC_FIELD = 'KROCC'
+PLCC_FIELD = 'PLCC'
+RMSE_FIELD = 'RMSE'
+PLCC_NOFIT_FIELD = 'PLCC_NOFIT'
+RMSE_NOFIT_FIELD = 'RMSE_NOFIT'
 
-def compute_correlations(a, b, normalize=True, do_fit=True):
+
+def compute_correlations(a, b, normalize=True):
     if normalize:
         aa = normalize_array(a)
         bb = normalize_array(b)
@@ -17,16 +27,28 @@ def compute_correlations(a, b, normalize=True, do_fit=True):
         bb = b.copy()
     spearman = scipy.stats.spearmanr(aa, bb).correlation
     kendall = scipy.stats.kendalltau(aa, bb).correlation
-    if do_fit:
-        # apply linear fitting before computing PLCC and RMSE
-        try:
-            fit_function = FitFunction(aa, bb)
-            aa = fit_function(aa)
-        except OverflowError as e:
-            print("WARNING:", e)
+
+    pearson_nofit = scipy.stats.pearsonr(aa, bb)[0]
+    rmse_nofit = ((aa - bb) ** 2).mean() ** 0.5
+
+    # apply linear fitting before computing PLCC and RMSE
+    try:
+        fit_function = FitFunction(bb, aa)
+        bb = fit_function(bb)  # target
+    except OverflowError as e:
+        log_warn("Overflow during logistic fit", e)
+
     pearson = scipy.stats.pearsonr(aa, bb)[0]
     rmse = ((aa - bb) ** 2).mean() ** 0.5
-    return spearman, kendall, pearson, rmse
+
+    return {
+        SROCC_FIELD: spearman,
+        KROCC_FIELD: kendall,
+        PLCC_FIELD: pearson,
+        RMSE_FIELD: rmse,
+        PLCC_NOFIT_FIELD: pearson_nofit,
+        RMSE_NOFIT_FIELD: rmse_nofit,
+    }
 
 
 ########################################################################################################################
@@ -36,6 +58,7 @@ class FitFunction:
                  source, target,
                  fit_function_to_use=1,
                  residuals_func='L1',
+                 pguess=None,
                  ):
         if fit_function_to_use == 1:
             self.pguess = (1.0, 1.0, np.median(source), 1.0, np.median(target))
@@ -51,16 +74,18 @@ class FitFunction:
         elif fit_function_to_use == 3:
             self.pguess = (1.0, 0.0, 1.0, 0.0)
             self.fit_function = FitFunction.fit_function3
-            self.info = 'Fit coeffs (p0, p1) in ' \
+            self.info = 'Fit coeffs (p0, p1) ' \
                         '"y = (p0 * x^2 + abs(p1) * x) + p2"'  # abs() needed to prevent sign flipping near 0
         elif fit_function_to_use == 4:
             self.pguess = (1.0, 1.0, 0.0)
             self.fit_function = FitFunction.fit_function4
             self.info = 'Fit coeffs (p0, p1, p2) in ' \
                         '"p0 / (p1 + exp(-p2*x))"'  # abs() needed to prevent sign flipping near 0
-
         else:
             raise ValueError("Unsupported fit function.")
+
+        if pguess is not None:
+            self.pguess = pguess
 
         if residuals_func == "L1":
             self.regularization = 1
@@ -81,6 +106,14 @@ class FitFunction:
         else:
             return self.fit_function(p, x)
 
+    def __str__(self):
+        return "FitFunction: {}\n" \
+               "init p={}\n" \
+               "fit p={}".format(
+            self.info,
+            [float2str3(f) for f in self.pguess],
+            [float2str3(f) for f in self.p])
+
     def residuals(self, p, x, y):
         return (y - self(x, p)) ** self.regularization
 
@@ -90,7 +123,7 @@ class FitFunction:
     @staticmethod
     def fit_function1(p, x):
         p0, p1, p2, p3, p4 = p[:5]
-        y = p0 * (0.5 - 1. / (1 + np.exp(p1 * (x - p2) + CORRELATIONS_EPS))) + abs(p3) * x + p4
+        y = p0 * (0.5 - 1. / (1. + np.exp(p1 * (x - p2) + CORRELATIONS_EPS))) + abs(p3) * x + p4
         return y
 
     @staticmethod
@@ -111,25 +144,56 @@ class FitFunction:
         return p0 / (p1 + np.exp(-x)) + p2
 
 
-def fit_values(source, target):
+def fit_values(source, target, verbose=False):
     """
     fit source array to target array, and return fitted values
     :param source:
     :param target:
+    :param verbose:
     :return:
     """
     # normalize model predictions then fit to results of the subjective study
     # source_norm = normalize_array(source)
     # target_norm = normalize_array(target)
     try:
-        return fit_regression(source, target)
+        return fit_regression(source, target, verbose)
     except OverflowError:
-        print("Warning: regression failed, returning unfitted input.")
+        log_warn("Regression failed, returning unfitted input.")
         return source.copy(), None
 
 
-def fit_regression(source, target):
+def fit_regression(source, target, max_fit_error=0.2, verbose=False):
     fit_function = FitFunction(source, target)
     source_fit = fit_function(source)
+
+    if verbose:
+        print(fit_function.info)
+        print(fit_function.p)
+
+        # plot the fitted vs unfitted points
+        plt.plot(target, target, 'g-')
+        plt.plot(source, target, 'bo', label='nofit', markersize=5, alpha=0.8)
+        plt.plot(source_fit, target, 'ro', label='fit', markersize=4, alpha=0.8)
+        plt.xlabel('a')
+        plt.ylabel('b')
+        plt.legend()
+        plt.show()
+
+        # plot the fitted function between 0-1
+        ar = np.arange(0, 1, 0.001)
+        ar_fit = fit_function(ar)
+        plt.plot(ar, ar_fit)
+        plt.plot(ar, ar)
+        plt.plot(source, source_fit, 'o')
+        plt.xlabel('x')
+        plt.ylabel('y')
+        plt.title('Fit function 0-1')
+        plt.show()
+
+    res_max = np.abs(source_fit - target).max()
+    max_allowed = max_fit_error * (target.max() - target.min())
+    if res_max > max_allowed:
+        log_warn("fit max error [{}] exceeds allowed [{}]).".format(
+            res_max, max_allowed))
 
     return source_fit, fit_function

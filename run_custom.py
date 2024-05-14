@@ -1,5 +1,5 @@
-from run_config import *
-import run_main
+from train_config import *
+import train
 
 
 def test_custom_vtamiq():
@@ -14,10 +14,7 @@ def test_custom_vtamiq():
     # dataset_split_config_base["split_type"] = SPLIT_TYPE_RANDOM
     dataset_split_config_base["split_type"] = SPLIT_TYPE_INDICES
 
-    dataloader_config[SPLIT_NAME_TEST][BATCH_SIZE] = 12
-    dataloader_config[SPLIT_NAME_TEST][PATCH_COUNT] = 2048
-
-    run_main.main()
+    train.train()
 
 
 def custom_test():
@@ -36,35 +33,29 @@ def custom_test():
     dataset_split_config_base["split_type"] = SPLIT_TYPE_INDICES
     # dataset_split_config_base["split_type"] = SPLIT_TYPE_RANDOM
 
-    dataloader_config[SPLIT_NAME_TEST][BATCH_SIZE] = 10
-    dataloader_config[SPLIT_NAME_TEST][PATCH_COUNT] = 2048
-
-    run_main.main()
+    train.train()
 
 
 def custom_run():
-    global_config["load_checkpoint_file"] = None
+    global_config["is_debug"] = True
+    global_config["dataloader_num_workers"] = 1
 
+    # TRAIN PARAMS
     global_config["model"] = MODEL_VTAMIQ
+    global_config["load_checkpoint_file"] = None
 
     global_config["do_train"] = True
     global_config["do_val"] = True
-    global_config["do_test"] = False
+    global_config["do_test"] = True
+    global_config["allow_use_full_dataset_test"] = False
 
-    # global_config["dataset"] = DATASET_KADIS700k
-    # global_config["dataset"] = DATASET_PIEAPP_TRAIN
-    global_config["dataset"] = DATASET_LIVE
+    global_config["dataset"] = DATASET_TID2013
 
-    global_config["optimizer_learning_rate"] = 0.0001
     global_config["num_epochs"] = 20
-    global_config["optimizer_decay_at_epochs"] = [10, 15]
-    global_config["scheduler_type"] = "multistep"
-    global_config["optimizer_learning_rate_decay_multistep"] = 0.1
+    global_config["optimizer_learning_rate"] = 0.0001
+    global_config["scheduler_type"] = "lambda"
 
-    # dataset_split_config_base["split_type"] = SPLIT_TYPE_INDICES
-    dataset_split_config_base["split_type"] = SPLIT_TYPE_RANDOM
-
-    run_main.main()
+    train.train()
 
 
 if __name__ == "__main__":

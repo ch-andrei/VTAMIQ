@@ -1,15 +1,16 @@
 import numpy as np
 import pandas as pd
-from data.datasets.iqa_datasets import FRIqaPatchDataset
+from data.patch_datasets import PatchFRIQADataset
 
 
-class CSIQDataset(FRIqaPatchDataset):
+class CSIQDataset(PatchFRIQADataset):
     num_ref_images = 30
     num_dist_images = -1  # special case, can be 28 or 29
+    img_dim = (512, 512)
 
     def __init__(self,
                  name="CSIQ",
-                 path="I:/Datasets/CSIQ",
+                 path="CSIQ",
                  **kwargs
                  ):
         self.distortions = {
@@ -21,11 +22,10 @@ class CSIQDataset(FRIqaPatchDataset):
             6: "contrast",
         }
 
-        self.img_dim = (512, 512)
-
         super(CSIQDataset, self).__init__(
             name=name,
             path=path,
+            # Dataset reports DMOS values [0-1]; larger values correspond to larger distortions; no need to reverse
             qs_reverse=False,
             **kwargs
         )
@@ -33,7 +33,6 @@ class CSIQDataset(FRIqaPatchDataset):
     def read_dataset(self):
         """
         returns a list of tuples (reference_image_path, distorted_image_path, quality)
-        where q is DMOS from CSIQ.
         :return:
         """
         ref_imgs_path = self.path + "/src_imgs"
@@ -68,14 +67,12 @@ class CSIQDataset(FRIqaPatchDataset):
                     comparisons_per_image[img_name] = []
                 comparisons_per_image[img_name].append((path_ref, path_dist, q))
 
+        # count number of distorted images per reference image;
+        # setup ref/dist paths
         paths_ref, paths_dist, qs = [], [], []
-
-        images = sorted(list(comparisons_per_image.keys()))
-
-        # add comparison counts for each image to the images list
-        # simulatenously, add corresponding paths
-        for i in range(len(images)):
-            img_name_ref = images[i]
+        image_names = sorted(list(comparisons_per_image.keys()))
+        dist_images_per_image = np.zeros(len(image_names), int)
+        for i, img_name_ref in enumerate(image_names):
             comparisons = comparisons_per_image[img_name_ref]
 
             for comparison in comparisons:
@@ -85,16 +82,6 @@ class CSIQDataset(FRIqaPatchDataset):
                 paths_dist.append(path_dist)
                 qs.append(q)
 
-            images[i] = (img_name_ref, len(comparisons))
+            dist_images_per_image[i] = len(comparisons)
 
-        self.images = images
-
-        return paths_ref, paths_dist, qs
-
-    # override
-    def comparisons_before_image(self, i):
-        return 0 if i < 1 else sum([item[1] for item in self.images[:i]])
-
-    # override
-    def comparisons_per_image(self, i):
-        return self.images[i][1]
+        self.process_dataset_data(qs, paths_ref, paths_dist, dist_images_per_image)

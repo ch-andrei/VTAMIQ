@@ -1,18 +1,21 @@
 import numpy as np
-from data.datasets.iqa_datasets import FRIqaPatchDataset
+from data.patch_datasets import PatchFRIQADataset
 
 
-class TID2013Dataset(FRIqaPatchDataset):
+class TID2013Dataset(PatchFRIQADataset):
     num_ref_images = 25
     num_dist_images = 120
+    num_distortions = 24
+    img_dim = (384, 512)
 
     def __init__(self,
                  name="TID2013",
-                 path="I:/Datasets/tid2013",
+                 path="tid2013",
                  **kwargs
                  ):
         """
         The original TID2013 dataset provides 3000 quality comparisons for 25 references images (512x384 resolution).
+
         :param path: path to TID2013 directory
         :param patch_dim: int or tuple (h x w), will sample a random square patch of this size
         :param patch_count: number of samples to return for each image
@@ -21,6 +24,11 @@ class TID2013Dataset(FRIqaPatchDataset):
         super(TID2013Dataset, self).__init__(
             name=name,
             path=path,
+            # From TID2013 readme: "Higher value of MOS (0 - minimal, 9 - maximal) corresponds to higher visual
+            # quality of the image."; reversing the scores is required as we assume zero is perfect quality.
+            # reverse False before linearize, reverse True after linearize to get the desired ordering.
+            qs_reverse=True,
+            qs_linearize=True,
             **kwargs
         )
 
@@ -28,19 +36,18 @@ class TID2013Dataset(FRIqaPatchDataset):
         # self.norm_mean = [0.4735, 0.4304, 0.3593]
         # self.norm_std = [0.2008, 0.2029, 0.1905]
 
-        self.img_dim = (384, 512)
-
-    def read_dataset(self,
-                     # to support reading datasets similar to TID, the following vars were added
-                     reference_images_path="/reference_images",
-                     distorted_images_path="/distorted_images",
-                     q_file_name="mos_with_names.txt",
-                     split_char=" ",
-                     q_ind=0,
-                     filename_ind=1,
-                     filename_ext="bmp",
-                     has_header=False
-                     ):
+    def read_dataset(
+            self,
+            # NOTE: params are exposed, because KADID reuses this read function with different params
+            reference_images_path="/reference_images",
+            distorted_images_path="/distorted_images",
+            q_file_name="mos_with_names.txt",
+            split_char=" ",
+            q_ind=0,
+            filename_ind=1,
+            filename_ext="bmp",
+            has_header=False
+    ):
         """
         returns a list of tuples (reference_image_path, distorted_image_path, quality)
         where q is MOS for original TID2013 or JOD for TID2013+.
@@ -67,12 +74,14 @@ class TID2013Dataset(FRIqaPatchDataset):
                 paths_dist.append(path_distorted)
                 qs.append(q)
 
-        return paths_ref, paths_dist, qs
+        dist_images_per_image = [self.num_dist_images for _ in range(self.num_ref_images)]
+        self.process_dataset_data(qs, paths_ref, paths_dist, dist_images_per_image)
 
 
 class TID2008Dataset(TID2013Dataset):
     # num_ref_images inherited from TID2013Dataset
     num_dist_images = 68
+    num_distortions = 17
 
     def __init__(self,
                  path='I:/Datasets/tid2008',
@@ -80,23 +89,21 @@ class TID2008Dataset(TID2013Dataset):
         super(TID2008Dataset, self).__init__(path=path, name="TID2008", **kwargs)
 
 
-class TID2013PlusDataset(TID2013Dataset):
-    def __init__(self,
-                 path='I:/Datasets/tid2013+',  # THIS WONT WORK SINCE WE REUSE TID2013, TODO: fix path issues
-                 **kwargs):
-        super(TID2013PlusDataset, self).__init__(path=path, name="TID2013+", **kwargs)
-
-    def read_dataset(self):
-        return super().read_dataset(q_file_name="JOD.csv",
-                                    split_char=",",
-                                    q_ind=1,
-                                    filename_ind=0,
-                                    has_header=True
-                                    )
-
-
-
-
+# class TID2013PlusDataset(TID2013Dataset):
+#     def __init__(self,
+#                  path='tid2013+',  # THIS WONT WORK SINCE WE REUSE TID2013, TODO: fix path issues
+#                  **kwargs):
+#         super(TID2013PlusDataset, self).__init__(path=path, name="TID2013+", **kwargs)
+#
+#     def read_dataset(self):
+#         return super().read_dataset(q_file_name="JOD.csv",
+#                                     split_char=",",
+#                                     q_ind=1,
+#                                     filename_ind=0,
+#                                     has_header=True
+#                                     )
+#
+#
 # class TID2013PairwiseDataset(Dataset):
 #     def __init__(self,
 #                  num_patches=1,
@@ -248,7 +255,3 @@ class TID2013PlusDataset(TID2013Dataset):
 #
 #     def __len__(self):
 #         return len(self.tid_dataset)
-
-
-
-

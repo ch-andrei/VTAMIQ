@@ -1,15 +1,16 @@
 import numpy as np
 import os
-from data.datasets.iqa_datasets import FRIqaPatchDataset, PairwiseFRIqaPatchDataset
+from data.patch_datasets import PatchFRIQADataset, PairwiseFRIQAPatchDataset
 
 
-class PieAPPTrainPairwise(PairwiseFRIqaPatchDataset):
+class PieAPPTrainPairwise(PairwiseFRIQAPatchDataset):
     num_ref_images = 140
     num_dist_images = 483
+    img_dim = (256, 256)
 
     def __init__(self,
                  name="PieAPPTrainPairwise",
-                 path="I:/Datasets/PieAPP_dataset",
+                 path="PieAPP_dataset",
                  **kwargs
                  ):
         super(PieAPPTrainPairwise, self).__init__(
@@ -19,12 +20,9 @@ class PieAPPTrainPairwise(PairwiseFRIqaPatchDataset):
             **kwargs
         )
 
-        self.img_dim = (256, 256)
-
     def read_dataset(self):
         """
         returns a list of tuples (reference_image_path, distorted_image_path, quality)
-        where q is DMOS
         :return:
         """
 
@@ -33,7 +31,7 @@ class PieAPPTrainPairwise(PairwiseFRIqaPatchDataset):
         labels_path = self.path + "/labels/train"
 
         paths_ref, paths_dist1, paths_dist2, qs = [], [], [], []
-        label_files = os.listdir(labels_path)
+        label_files = sorted(os.listdir(labels_path))
         for label_filename in label_files:
             with open("{}/{}".format(labels_path, label_filename), 'r') as label_file:
                 label_file.__next__()  # skip header
@@ -55,16 +53,23 @@ class PieAPPTrainPairwise(PairwiseFRIqaPatchDataset):
                     paths_dist2.append(path_distorted2)
                     qs.append(q)
 
-        return paths_ref, paths_dist1, paths_dist2, qs
+        self.qs = np.array(qs)
+        self.paths_ref = paths_ref
+        self.paths_dist1 = paths_dist1
+        self.paths_dist2 = paths_dist2
+
+        self.dist_images_per_image = np.array([self.num_dist_images for _ in range(self.num_ref_images)])
+        self.dist_images_before_image = self.compute_dist_images_before_image(self.dist_images_per_image)
 
 
-class PieAPPTestset(FRIqaPatchDataset):
+class PieAPPTestset(PatchFRIQADataset):
     num_ref_images = 40
     num_dist_images = 15
+    img_dim = (256, 256)
 
     def __init__(self,
                  name="PieAPPTestset",
-                 path="I:/Datasets/PieAPP_dataset",
+                 path="PieAPP_dataset",
                  **kwargs
                  ):
         super(PieAPPTestset, self).__init__(
@@ -76,12 +81,9 @@ class PieAPPTestset(FRIqaPatchDataset):
             **kwargs
         )
 
-        self.img_dim = (256, 256)
-
     def read_dataset(self):
         """
         returns a list of tuples (reference_image_path, distorted_image_path, quality)
-        where q is DMOS
         :return:
         """
 
@@ -115,4 +117,5 @@ class PieAPPTestset(FRIqaPatchDataset):
                         paths_dist.append(path_distorted)
                         qs.append(q)
 
-        return paths_ref, paths_dist, qs
+        dist_images_per_image = [self.num_dist_images for _ in range(self.num_ref_images)]
+        self.process_dataset_data(qs, paths_ref, paths_dist, dist_images_per_image)

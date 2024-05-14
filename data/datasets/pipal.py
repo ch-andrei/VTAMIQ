@@ -1,32 +1,35 @@
 import numpy as np
 import os
-from data.datasets.iqa_datasets import FRIqaPatchDataset
+from data.patch_datasets import PatchFRIQADataset
 
 
-class PIPAL(FRIqaPatchDataset):
+class PIPAL(PatchFRIQADataset):
     num_ref_images = 200
     num_dist_images = 116
+    num_distortions = 75
+    img_dim = (288, 288)
 
     def __init__(self,
                  name="PIPAL",
-                 path="I:/Datasets/PIPAL",
+                 path="PIPAL",
                  **kwargs
                  ):
         super(PIPAL, self).__init__(
             name=name,
             path=path,
 
-            # qs_linearize=False,
+            # PIPAL provides ELO scores for images; lower ELO scores correspond to lower quality; must reverse.
+            # disabling reverse before linearize yields a less aggressive fit; with reverse, better normalization, but
+            # more extreme bad quality samples which seems inadequate.
+            qs_reverse=True,
+            qs_linearize=True,
 
             **kwargs
         )
 
-        self.img_dim = (288, 288)
-
     def read_dataset(self):
         """
         returns a list of tuples (reference_image_path, distorted_image_path, quality)
-        where q is DMOS
         :return:
         """
 
@@ -36,7 +39,7 @@ class PIPAL(FRIqaPatchDataset):
 
         paths_ref, paths_dist, qs = [], [], []
 
-        for filename in os.listdir(labels_path):
+        for filename in sorted(os.listdir(labels_path)):
             with open(labels_path + "/" + filename, 'r') as input_file:
                 for line in input_file:
                     line = line.strip()
@@ -49,11 +52,12 @@ class PIPAL(FRIqaPatchDataset):
                     path_reference = reference_images_path + '/' + ref_name
                     path_distorted = distorted_images_path + '/' + dist_name
 
+                    qs.append(q)
                     paths_ref.append(path_reference)
                     paths_dist.append(path_distorted)
-                    qs.append(q)
 
-        return paths_ref, paths_dist, qs
+        dist_images_per_image = [self.num_dist_images for _ in range(self.num_ref_images)]
+        self.process_dataset_data(qs, paths_ref, paths_dist, dist_images_per_image)
 
 
 class PIPALTest(PIPAL):
@@ -70,16 +74,12 @@ class PIPALTest(PIPAL):
         super(PIPALTest, self).__init__(
             name=name,
             qs_plot=False,
-            qs_normalize=False,
-            qs_reverse=False,
-            qs_normalize_mean_std=False,
             **kwargs
         )
 
     def read_dataset(self):
         """
         returns a list of tuples (reference_image_path, distorted_image_path, quality)
-        where q is DMOS
         :return:
         """
 
@@ -88,17 +88,18 @@ class PIPALTest(PIPAL):
 
         paths_ref, paths_dist, qs = [], [], []
 
-        for dist_name in os.listdir(distorted_images_path):
+        for dist_name in sorted(os.listdir(distorted_images_path)):
             ref_name = dist_name[:5] + ".bmp"  # first 5 characters
 
             path_reference = reference_images_path + '/' + ref_name
             path_distorted = distorted_images_path + '/' + dist_name
 
+            qs.append(-1)
             paths_ref.append(path_reference)
             paths_dist.append(path_distorted)
-            qs.append(-1)
 
-        return paths_ref, paths_dist, qs
+        dist_images_per_image = [self.num_dist_images for _ in range(self.num_ref_images)]
+        self.process_dataset_data(qs, paths_ref, paths_dist, dist_images_per_image)
 
 
 class PIPALVal(PIPALTest):

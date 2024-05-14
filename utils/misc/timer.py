@@ -1,13 +1,12 @@
 import time
-from utils.miscelaneous import float2str
 
 
-# Timer counting seconds since start
-# can be reused multiple times and get average runtime by repeatedly calling start() + stop()
-# can be paused via calling pause() between start() and stop()
+# Timer counting seconds since start.
+# can be reused multiple times and get average runtime by repeatedly calling start() + stop().
+# can be paused by calling pause() between start() and stop().
 class Timer:
-    def __init__(self, name="", start=False):
-        self.name = "Timer" + name if name else str(time.time())
+    def __init__(self, name="", start=False, verbose=True):
+        self.name = "Timer-" + name if name else f"Timer-{str(time.time())}"
         self.start_time = None
         self.paused = False
         self.stopped = False
@@ -19,8 +18,17 @@ class Timer:
         self.use_count = 0
         self.delta = 0
         self.deltas = []
+        self.verbose = verbose
         if start:
             self.start()
+
+    def __enter__(self):
+        self.start()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        delta = self.stop()
+        if self.verbose:
+            print(f"Timer {self.name} delta={delta} sec.")
 
     def reset(self):
         self.__init__(name=self.name, start=False)
@@ -30,6 +38,7 @@ class Timer:
         self.stopped = False
         self.paused_time = None
         self.total_paused = 0
+        # self.use_count = 0
 
     def start(self):
         self.restart()
@@ -50,6 +59,9 @@ class Timer:
             self.paused_time = None
         self.paused = False
 
+    def total(self):
+        return sum(self.deltas)
+
     def stop(self):
         if not self.stopped:
             self.stopped = True
@@ -63,8 +75,7 @@ class Timer:
             self.use_count += 1
         return self.delta
 
-    def __str__(self):
-        return "Timer {}: d_last={}s; d_max={}s); d_avg={}s".format(self.name,
-                                                                    float2str(self.delta),
-                                                                    float2str(self.delta_max),
-                                                                    float2str(self.delta_avg))
+    def time_runs(self, num_runs, function: callable, *args, **kwargs):
+        with self:
+            for i in range(num_runs):
+                function(*args, **kwargs)
